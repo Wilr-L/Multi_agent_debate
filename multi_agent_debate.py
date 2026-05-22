@@ -562,13 +562,12 @@ class VLMInterface:
             )
 
         user_msg = self._build_user_message(user_prompt, image_path)
-        # Strip image_url parts from prior turns; only the new user_msg
-        # keeps its image. The debate flow re-attaches the SAME scene
-        # image every turn — the model has already attended to it in
-        # earlier turns, so the duplicates only waste tokens (~256-4096
-        # KV tokens per Qwen-VL image) and trip vLLM's `limit_mm_per_prompt`
-        # on the local backend.
-        messages = self._strip_images_from_history(self.conversation_history) + [user_msg]
+        # Stateless: send only system + current user_msg. The debate
+        # engine already embeds all relevant state in each prompt, so
+        # replaying conversation_history just duplicates info and was
+        # blowing past --max-model-len in long retry loops. See
+        # _build_stateless_messages docstring for the full rationale.
+        messages = self._build_stateless_messages(self.conversation_history, user_msg)
 
         payload = {
             "model":       self.model_name,
@@ -725,6 +724,26 @@ class VLMInterface:
             else:
                 out.append(msg)
         return out
+
+    @staticmethod
+    def _build_stateless_messages(conversation_history: list[dict],
+                                  user_msg: dict) -> list[dict]:
+        """Return `[system_prompt, user_msg]` (or just `[user_msg]` if
+        no system prompt was set).
+
+        Why stateless: MultiAgentDebateEngine already embeds the full
+        debate state explicitly in every prompt (CRITIQUE_PROMPT carries
+        current_plan_json + other_critique + a 6-message debate_history;
+        REFLECTION_PROMPT carries failed_plan_json + debate_summary; …).
+        Carrying conversation_history as well duplicates the same info
+        in raw form and is what blew past --max-model-len in long
+        retry loops. conversation_history is still kept on the
+        VLMInterface instance for logger / inspection use — just not
+        replayed back to the model."""
+        system_msg = None
+        if conversation_history and conversation_history[0].get("role") == "system":
+            system_msg = conversation_history[0]
+        return ([system_msg] if system_msg else []) + [user_msg]
 
     def _build_user_message(self, prompt: str, image_path: Optional[str]) -> dict:
         if not image_path:
@@ -1538,9 +1557,14 @@ class MultiAgentDebateEngine:
             partner_name=self.robot2.name,
         )
 
-        # The image is already in VLM1's history from Phase 1, no need to
-        # re-attach. (Skipping the attachment also keeps payload size down.)
-        response = self.vlm1.query(prompt, image_path=None)
+        # Stateless query() doesn't carry the image from prior turns,
+        # so we re-attach the scene image here. (Pre-stateless behavior
+        # assumed the image was still in VLM1's conversation_history
+        # from Phase 1, but that's no longer the path.)
+        response = self.vlm1.query(
+            prompt,
+            image_path=state.scene_image_path if state else None,
+        )
         merged = parse_plan_from_response(response)
 
         if merged is not None:

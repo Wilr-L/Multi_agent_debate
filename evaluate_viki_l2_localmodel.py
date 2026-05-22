@@ -174,10 +174,11 @@ class LocalVLMInterface:
 
     def query(self, user_prompt: str, image_path: Optional[str] = None) -> str:
         user_msg = self._build_user_message(user_prompt, image_path)
-        # Strip images from prior turns; only the new user_msg keeps its
-        # image. This bypasses vLLM's per-request image cap. The helper
-        # lives on VLMInterface so both backends share one implementation.
-        messages = VLMInterface._strip_images_from_history(self.conversation_history) + [user_msg]
+        # Stateless: just system + current user_msg. Matches the API-side
+        # VLMInterface, and keeps each request well under --max-model-len
+        # in long debate loops. See VLMInterface._build_stateless_messages
+        # for why this is safe (debate engine embeds state in prompts).
+        messages = VLMInterface._build_stateless_messages(self.conversation_history, user_msg)
 
         # vLLM's offline `chat()` applies the model's chat template AND
         # extracts multimodal payloads from OpenAI-format `image_url`
