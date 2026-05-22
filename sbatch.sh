@@ -9,9 +9,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=0-12:00
 
-module load soft/anaconda3/config
-source activate
-conda activate embodi2
+source ~/.bashrc
+conda activate debate
 
 python evaluate_viki_l2_localmodel.py --model-path "/scratch/users/k25159491/WORK/Model/Qwen2.5-VL-3B-Instruct" \
     --tensor-parallel-size 2 --max-model-len 8192 --gpu-mem-util 0.90 \

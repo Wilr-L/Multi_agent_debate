@@ -562,7 +562,13 @@ class VLMInterface:
             )
 
         user_msg = self._build_user_message(user_prompt, image_path)
-        messages = self.conversation_history + [user_msg]
+        # Strip image_url parts from prior turns; only the new user_msg
+        # keeps its image. The debate flow re-attaches the SAME scene
+        # image every turn — the model has already attended to it in
+        # earlier turns, so the duplicates only waste tokens (~256-4096
+        # KV tokens per Qwen-VL image) and trip vLLM's `limit_mm_per_prompt`
+        # on the local backend.
+        messages = self._strip_images_from_history(self.conversation_history) + [user_msg]
 
         payload = {
             "model":       self.model_name,
@@ -699,6 +705,26 @@ class VLMInterface:
         mime = mime or "image/png"
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         return f"data:{mime};base64,{encoded}"
+
+    @staticmethod
+    def _strip_images_from_history(history: list[dict]) -> list[dict]:
+        """Return a copy of `history` with every `image_url` content part
+        removed. Used by `query()` to avoid re-sending the same scene
+        image on every debate turn — duplicates trip vLLM's
+        `limit_mm_per_prompt` cap and waste KV tokens on API backends
+        that don't error out (e.g. SiliconFlow). The image stays on the
+        CURRENT user turn, which is enough for the model to attend to."""
+        out: list[dict] = []
+        for msg in history:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = [p for p in content if p.get("type") != "image_url"]
+                if not text_parts:
+                    text_parts = [{"type": "text", "text": ""}]
+                out.append({**msg, "content": text_parts})
+            else:
+                out.append(msg)
+        return out
 
     def _build_user_message(self, prompt: str, image_path: Optional[str]) -> dict:
         if not image_path:

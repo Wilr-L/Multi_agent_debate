@@ -18,6 +18,8 @@ Example:
         --gpu-mem-util 0.9 \\
         --trust-remote-code
 
+    python evaluate_viki_l2_localmodel.py  --model-path /scratch/users/k25159491/WORK/Model/Qwen2.5-VL-3B-Instruct  --limit 20  --max-model-len 8192  --gpu-mem-util 0.9  --trust-remote-code
+
 TensorBoard scalars use the SAME tag names as evaluate_viki_l2.py /
 evaluate_viki_l2_baseline.py so all three runs overlay cleanly.
 """
@@ -172,7 +174,10 @@ class LocalVLMInterface:
 
     def query(self, user_prompt: str, image_path: Optional[str] = None) -> str:
         user_msg = self._build_user_message(user_prompt, image_path)
-        messages = self.conversation_history + [user_msg]
+        # Strip images from prior turns; only the new user_msg keeps its
+        # image. This bypasses vLLM's per-request image cap. The helper
+        # lives on VLMInterface so both backends share one implementation.
+        messages = VLMInterface._strip_images_from_history(self.conversation_history) + [user_msg]
 
         # vLLM's offline `chat()` applies the model's chat template AND
         # extracts multimodal payloads from OpenAI-format `image_url`
