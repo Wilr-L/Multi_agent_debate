@@ -257,6 +257,34 @@ def parse_args():
     p.add_argument("--trust-remote-code", action="store_true",
                    help="pass trust_remote_code=True to vLLM (needed for "
                         "models whose modeling code lives in the HF repo).")
+    p.add_argument("--quantization", default=None,
+                   choices=[None, "bf16", "int8", "int4", "fp8",
+                            "awq", "gptq", "bitsandbytes"],
+                   help="weight quantization mode. Default = None / bf16 "
+                        "(full precision, uses --dtype). "
+                        "'int8' / 'int4' load the bf16 checkpoint and "
+                        "on-the-fly quantize via bitsandbytes — works with "
+                        "any HF model but needs `pip install bitsandbytes` "
+                        "and torch built with CUDA. 'fp8' needs Hopper/"
+                        "Blackwell hardware AND vLLM's FP8 path (no extra "
+                        "deps). 'awq' / 'gptq' / 'bitsandbytes' require a "
+                        "pre-quantized checkpoint at --model-path.")
+    p.add_argument("--load-format", default="auto",
+                   help="vLLM load_format (default 'auto'). Override only "
+                        "if a quantization mode requires it (rarely needed; "
+                        "--quantization int8/int4 set this automatically).")
+    p.add_argument("--enforce-eager", action="store_true",
+                   help="disable torch.compile + cudagraph capture. vLLM v1 "
+                        "captures up to 64 cudagraphs (batch sizes 1..512) "
+                        "by default, which can pre-reserve 20-30 GB on a "
+                        "single A100 even for a 3B model. Eager mode is "
+                        "20-30%% slower but uses MUCH less memory — "
+                        "recommended for single-stream evaluation like this.")
+    p.add_argument("--max-num-seqs", type=int, default=None,
+                   help="cap on concurrent sequences vLLM will batch. "
+                        "Defaults to vLLM's own default (256). Set to 4-8 "
+                        "for single-stream eval to shrink cudagraph capture "
+                        "memory without going fully eager.")
 
     # Sampling
     p.add_argument("--temperature", type=float, default=0.3,
@@ -365,13 +393,40 @@ def main():
     print(f"Per-task JSON       → {results_json}")
     print()
 
+    # ── Map our friendly --quantization flag to vLLM's args ──
+    # Default (None / 'bf16') = no quantization, pure --dtype.
+    # 'int8' / 'int4' use bitsandbytes for on-the-fly quantization of an
+    # unquantized HF checkpoint (needs `pip install bitsandbytes`); we
+    # additionally set load_format='bitsandbytes' so vLLM's loader picks
+    # the BnB code path. The exact 8-bit vs 4-bit mode comes from
+    # bitsandbytes-itself defaults — int8 here forces 8-bit via env.
+    # 'fp8', 'awq', 'gptq', 'bitsandbytes' pass through verbatim
+    # (those modes expect either FP8-capable HW or a pre-quantized ckpt).
+    quant       = args.quantization
+    load_format = args.load_format
+    if quant in (None, "bf16"):
+        quant = None                        # vLLM default = full precision
+    elif quant == "int8":
+        os.environ.setdefault("BNB_QUANTIZATION", "int8")
+        quant = "bitsandbytes"
+        if load_format == "auto":
+            load_format = "bitsandbytes"
+    elif quant == "int4":
+        os.environ.setdefault("BNB_QUANTIZATION", "nf4")
+        quant = "bitsandbytes"
+        if load_format == "auto":
+            load_format = "bitsandbytes"
+    # 'fp8' / 'awq' / 'gptq' / 'bitsandbytes' → pass through verbatim
+
     # ── Load model ONCE — both debaters share this LLM instance ──
     print(f"Loading local model with vLLM: {args.model_path}")
     print(f"  max_model_len={args.max_model_len}  "
           f"gpu_mem_util={args.gpu_mem_util}  "
-          f"dtype={args.dtype}  tp={args.tensor_parallel_size}")
+          f"dtype={args.dtype}  tp={args.tensor_parallel_size}  "
+          f"quantization={args.quantization or 'bf16'}  "
+          f"load_format={load_format}")
     llm_t0 = time.time()
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model_path,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_mem_util,
@@ -379,7 +434,15 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
         limit_mm_per_prompt={"image": 1},   # VIKI-L2 = one scene image per call
+        enforce_eager=args.enforce_eager,
     )
+    if quant is not None:
+        llm_kwargs["quantization"] = quant
+    if load_format != "auto":
+        llm_kwargs["load_format"] = load_format
+    if args.max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = args.max_num_seqs
+    llm = LLM(**llm_kwargs)
     print(f"  loaded in {time.time() - llm_t0:.1f}s")
 
     sampling_params = SamplingParams(
