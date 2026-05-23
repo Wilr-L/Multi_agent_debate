@@ -1466,15 +1466,28 @@ class MultiAgentDebateEngine:
         self.vlm2.set_system_prompt(render(self.robot2, self.robot1))
 
     def _format_debate_history(self, state: DebateState) -> str:
-        """Format debate history for inclusion in prompts."""
+        """Format debate history for inclusion in prompts.
+
+        Since VLMInterface.query() is now stateless, this summary is the
+        ONLY way the model sees prior turns — so the per-message cap and
+        message count are sized to leave a plan JSON intact (a typical
+        VIKI plan response is 1500-2500 chars). Bumping past these
+        numbers eats into the generation budget, so keep an eye on
+        max_prompt_tokens in the per-task stats."""
         if not state.messages:
             return "(No previous debate messages)"
 
+        MAX_CHARS_PER_MSG = 2500   # was 500 — truncated plan JSON mid-step
+        MAX_MESSAGES      = 8      # was 6 — covers phase1 ×3 + ~5 debate rounds
+
         lines = []
-        for msg in state.messages[-6:]:  # Keep last 6 messages to manage context length
-            role_label = f"VLM1({self.robot1.robot_id})" if msg.role == DebateRole.VLM1_R1_ADVOCATE else f"VLM2({self.robot2.robot_id})"
-            # Truncate long messages
-            content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+        for msg in state.messages[-MAX_MESSAGES:]:
+            role_label = (f"VLM1({self.robot1.robot_id})"
+                          if msg.role == DebateRole.VLM1_R1_ADVOCATE
+                          else f"VLM2({self.robot2.robot_id})")
+            content = (msg.content[:MAX_CHARS_PER_MSG] + "..."
+                       if len(msg.content) > MAX_CHARS_PER_MSG
+                       else msg.content)
             lines.append(f"[{role_label}]: {content}")
         return "\n\n".join(lines)
 

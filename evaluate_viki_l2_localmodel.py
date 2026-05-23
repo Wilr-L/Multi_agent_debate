@@ -17,7 +17,8 @@ Example:
         --max-model-len 8192 \\
         --gpu-mem-util 0.9 \\
         --trust-remote-code
-
+        
+    salloc -p gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=8 --nodes=1 --time 240 --constraint a100
     python evaluate_viki_l2_localmodel.py  --model-path /scratch/users/k25159491/WORK/Model/Qwen2.5-VL-3B-Instruct  --limit 20  --max-model-len 8192  --gpu-mem-util 0.9  --trust-remote-code
 
 TensorBoard scalars use the SAME tag names as evaluate_viki_l2.py /
