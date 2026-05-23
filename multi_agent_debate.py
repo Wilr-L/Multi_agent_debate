@@ -171,7 +171,7 @@ STOMPY_PROFILE = RobotProfile(name="stompy", robot_id="R2")
 
 # ── 2.1 System Prompts ──
 
-SYSTEM_PROMPT0 = """\
+SYSTEM_PROMPT = """\
 You are a plan creator for a multi-robot team in VIKI-Bench. You are the ADVOCATE for \
 robot {robot_id} ({robot_name}). I will provide you with an image of the robots in a scene, \
 the available robots and their action primitives, and a task description. You need to debate \
@@ -236,7 +236,7 @@ Rules:
 
 
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT0 = """\
 You are a plan creator for a multi-robot team in VIKI-Bench. You are the ADVOCATE for \
 robot {robot_id} ({robot_name}). I will provide you with an image of the robots in a scene, \
 the available robots and their action primitives, and a task description. You need to debate \
