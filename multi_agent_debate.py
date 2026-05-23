@@ -1465,29 +1465,79 @@ class MultiAgentDebateEngine:
         self.vlm1.set_system_prompt(render(self.robot1, self.robot2))
         self.vlm2.set_system_prompt(render(self.robot2, self.robot1))
 
+    @staticmethod
+    def _compact_history_msg(content: str,
+                             max_reasoning_chars: int = 400,
+                             fallback_chars: int = 2500) -> str:
+        """Reformat a debate-message body so the plan `steps` are kept
+        IN FULL (those are what the next round needs to decide
+        ACCEPT/REVISE) and only the verbose `reasoning` prose is
+        truncated. Falls back to plain char-truncation if the content
+        doesn't parse as JSON (e.g. the implicit-ACCEPT placeholder, or
+        a model that forgot the JSON wrapper).
+
+        Handles both response shapes the debate engine produces:
+          • Plain plan : {reasoning, steps}
+          • Critique   : {verdict, issues?, revised_plan: {reasoning, steps}}
+                         or {verdict: "ACCEPT", reasoning}"""
+        s = content.find("{")
+        e = content.rfind("}") + 1
+        if s == -1 or e == 0:
+            return (content[:fallback_chars] + "..."
+                    if len(content) > fallback_chars else content)
+        try:
+            data = json.loads(content[s:e])
+        except (json.JSONDecodeError, TypeError):
+            return (content[:fallback_chars] + "..."
+                    if len(content) > fallback_chars else content)
+
+        def trunc(text):
+            text = str(text)
+            return (text[:max_reasoning_chars] + "..."
+                    if len(text) > max_reasoning_chars else text)
+
+        compact: dict = {}
+        if "verdict" in data:
+            compact["verdict"] = data["verdict"]
+            if data.get("verdict") == "ACCEPT":
+                if "reasoning" in data:
+                    compact["reasoning"] = trunc(data["reasoning"])
+            else:                                          # REVISE
+                if "issues" in data:
+                    compact["issues"] = data["issues"]
+                rp = data.get("revised_plan")
+                if isinstance(rp, dict):
+                    compact["revised_plan"] = {
+                        "reasoning": trunc(rp.get("reasoning", "")),
+                        "steps":     rp.get("steps", []),  # FULL — never trimmed
+                    }
+        elif "steps" in data:
+            compact["reasoning"] = trunc(data.get("reasoning", ""))
+            compact["steps"]     = data["steps"]           # FULL — never trimmed
+        else:
+            return (content[:fallback_chars] + "..."
+                    if len(content) > fallback_chars else content)
+
+        return json.dumps(compact, indent=2)
+
     def _format_debate_history(self, state: DebateState) -> str:
         """Format debate history for inclusion in prompts.
 
         Since VLMInterface.query() is now stateless, this summary is the
-        ONLY way the model sees prior turns — so the per-message cap and
-        message count are sized to leave a plan JSON intact (a typical
-        VIKI plan response is 1500-2500 chars). Bumping past these
-        numbers eats into the generation budget, so keep an eye on
-        max_prompt_tokens in the per-task stats."""
+        ONLY way the model sees prior turns. Per-message compaction
+        keeps the actionable parts (verdict + steps) in full and only
+        trims the prose `reasoning` field — see _compact_history_msg."""
         if not state.messages:
             return "(No previous debate messages)"
 
-        MAX_CHARS_PER_MSG = 2500   # was 500 — truncated plan JSON mid-step
-        MAX_MESSAGES      = 8      # was 6 — covers phase1 ×3 + ~5 debate rounds
+        MAX_MESSAGES = 8     # covers phase1 ×3 + ~5 debate rounds
 
         lines = []
         for msg in state.messages[-MAX_MESSAGES:]:
             role_label = (f"VLM1({self.robot1.robot_id})"
                           if msg.role == DebateRole.VLM1_R1_ADVOCATE
                           else f"VLM2({self.robot2.robot_id})")
-            content = (msg.content[:MAX_CHARS_PER_MSG] + "..."
-                       if len(msg.content) > MAX_CHARS_PER_MSG
-                       else msg.content)
+            content = self._compact_history_msg(msg.content)
             lines.append(f"[{role_label}]: {content}")
         return "\n\n".join(lines)
 
