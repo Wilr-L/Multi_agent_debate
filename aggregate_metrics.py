@@ -5,7 +5,9 @@ Aggregate evaluation metrics over a results directory produced by
 `evaluate_viki_l2_localmodel.py` / `evaluate_viki_l2.py`.
 
 Reports the average of:
-  - delta_steps          : (generated plan steps) - (ground-truth steps)
+  - delta_steps          : (generated plan steps) - (ground-truth steps),
+                           averaged over SUCCESSFUL tasks only (a failed
+                           plan's length is not comparable to ground truth)
   - Convergence Rounds   : debate rounds to first consensus (rounds of loop 1)
   - First-Pass Success   : fraction where the first consensus plan passed
                            validation directly (no retry)
@@ -284,7 +286,10 @@ def main():
         return statistics.mean(vals) if vals else None, len(vals)
 
     n_total       = len(rows)
-    delta_mean, delta_n   = mean([x["delta_steps"] for x in rows])
+    # delta_steps is only meaningful for plans that actually succeeded — a
+    # failed plan may have been cut short mid-execution, so its length is
+    # not comparable to the ground-truth plan length.
+    delta_mean, delta_n   = mean([x["delta_steps"] for x in rows if x["success"]])
     conv_mean,  conv_n    = mean([x["conv_rounds"] for x in rows])
     loops_mean, loops_n   = mean([x["loops"]       for x in rows])
     token_mean, token_n   = mean([x["tokens"]      for x in rows])
@@ -302,7 +307,7 @@ def main():
     print(f"Token estimator:  {tok_label};  image={args.image_tokens} tok/img")
     print("-" * 64)
     print(f"  delta_steps           {fmt(delta_mean):>10}   "
-          f"(gen - gt, n={delta_n})")
+          f"(gen - gt, SUCCESSFUL tasks only, n={delta_n})")
     print(f"  Convergence Rounds    {fmt(conv_mean):>10}   "
           f"(rounds of loop 1, n={conv_n})")
     print(f"  First-Pass Success    {fmt(first_pass_rate):>10}   "
