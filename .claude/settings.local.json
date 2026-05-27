@@ -10,7 +10,9 @@
       "Bash(/e/anaconda3/python.exe -c \"import requests; print\\('requests', requests.__version__\\)\")",
       "Bash(/e/anaconda3/python.exe viki_loader.py)",
       "Bash(/e/anaconda3/python.exe -m pip install tensorboard tensorboardX)",
-      "PowerShell(E:\\\\anaconda3\\\\python.exe e:\\\\KCL\\\\Multi_agent_debate\\\\diagnose_baseline.py)"
+      "PowerShell(E:\\\\anaconda3\\\\python.exe e:\\\\KCL\\\\Multi_agent_debate\\\\diagnose_baseline.py)",
+      "Bash(E:/anaconda3/python.exe -c ' *)",
+      "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_020504 --verbose)"
     ]
   }
 }

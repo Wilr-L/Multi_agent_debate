@@ -202,7 +202,6 @@ Choose the primitive that advances the current object state, not just the task n
   - If something is at the kitchen work area, the robot could move to, reach, and grasp it. If something is in the carbinet, the robot should first open the carbinet.
   - If the robot needs to open the carbinet, fridge, or other container, the robots should move to and reach and then open it.
   - If the robot has opened the carbinet to grasp an apple in it, the robot still needs to move to, reach and then grasp the apple.
-  - Note that 
   - Note that the robot should not always wait throughout all steps.
 
 ## Your role
