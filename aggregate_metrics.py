@@ -191,10 +191,40 @@ def load_gt_steps(parquet_path: Path, indices: list[int]) -> dict[int, int]:
 
 # ─── Main ─────────────────────────────────────────────────────────────
 
+def discover_result_dirs(paths: list[Path]) -> list[Path]:
+    """Expand the given paths into a list of leaf result dirs (each holding
+    a results.json + task_* folders). A path is taken as a leaf if it
+    contains results.json directly; otherwise it's treated as a parent and
+    every `*/results.json` child is collected (so you can pass the
+    `evaluate_results` parent and pick up every local_* run). Duplicates
+    are removed, order is preserved."""
+    leaves, seen = [], set()
+    for p in paths:
+        if (p / "results.json").is_file():
+            cands = [p]
+        else:
+            cands = sorted(c.parent for c in p.glob("*/results.json"))
+        for c in cands:
+            rp = c.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                leaves.append(c)
+    return leaves
+
+
+def find_task_dir(source_dir: Path, idx: int) -> Optional[Path]:
+    hits = sorted(source_dir.glob(f"task_{idx:05d}_*"))
+    return hits[0] if hits else None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Aggregate VIKI debate eval metrics")
-    p.add_argument("results_dir",
-                   help="a results dir containing results.json + task_* folders")
+    p.add_argument("results_dirs", nargs="+",
+                   help="one or more result dirs (each with results.json + "
+                        "task_* folders), OR a parent dir like "
+                        "`evaluate_results` to auto-discover every local_* "
+                        "run inside it. Records from interrupted/resumed runs "
+                        "are merged; duplicate idx keeps the last one seen.")
     p.add_argument("--parquet", default="VIKI_data/viki/VIKI-L2/test.parquet",
                    help="VIKI-L2 parquet for ground-truth step counts")
     p.add_argument("--tokenizer-path", default=None,
@@ -215,37 +245,52 @@ def parse_args():
 def main():
     args = parse_args()
 
-    root = Path(args.results_dir)
-    results_json = root / "results.json"
-    if not results_json.is_file():
-        print(f"[ERROR] {results_json} not found.", file=sys.stderr)
+    leaf_dirs = discover_result_dirs([Path(p) for p in args.results_dirs])
+    if not leaf_dirs:
+        print(f"[ERROR] no results.json found under: {args.results_dirs}",
+              file=sys.stderr)
         sys.exit(1)
 
     parquet_path = Path(args.parquet)
     if not parquet_path.is_absolute():
         parquet_path = Path(__file__).resolve().parent / parquet_path
 
-    records = json.loads(results_json.read_text(encoding="utf-8"))
-    evaluated = [r for r in records if "success" in r]   # skip load/runtime errors
-    n_err = len(records) - len(evaluated)
+    # ── Merge records across all runs, tagging each with its source dir. ──
+    # idx -> (record, source_dir). On duplicate idx (a resumed run re-did a
+    # task) the LATER source dir wins, since leaf_dirs is in discovery order
+    # and resumed runs come later.
+    by_idx: dict[int, tuple[dict, Path]] = {}
+    n_err = 0
+    n_dup = 0
+    print(f"Merging {len(leaf_dirs)} result dir(s):")
+    for d in leaf_dirs:
+        recs = json.loads((d / "results.json").read_text(encoding="utf-8"))
+        n_ok = sum(1 for r in recs if "success" in r)
+        print(f"  {d}  ({n_ok} evaluated / {len(recs)} records)")
+        for r in recs:
+            if "success" not in r:           # skip load/runtime error records
+                n_err += 1
+                continue
+            idx = r["idx"]
+            if idx in by_idx:
+                n_dup += 1
+            by_idx[idx] = (r, d)
+    if n_dup:
+        print(f"  [WARN] {n_dup} duplicate idx across dirs — kept the "
+              f"later run's record for each.")
+
+    evaluated = [by_idx[i] for i in sorted(by_idx)]
     if not evaluated:
         print("No evaluated tasks (every record is an error). Nothing to do.")
         return
 
-    # Ground-truth step counts.
-    gt_steps = load_gt_steps(parquet_path, [r["idx"] for r in evaluated])
+    # Ground-truth step counts (one parquet read for all idxs).
+    gt_steps = load_gt_steps(parquet_path, [r["idx"] for r, _ in evaluated])
 
     count_fn, tok_label = _make_token_counter(args.tokenizer_path, args.chars_per_token)
 
-    # Map idx -> task folder.
-    task_dirs = {}
-    for d in root.glob("task_*"):
-        m = re.match(r"task_(\d+)_", d.name)
-        if m:
-            task_dirs[int(m.group(1))] = d
-
     rows = []
-    for r in evaluated:
+    for r, src_dir in evaluated:
         idx          = r["idx"]
         loops        = r.get("debate_loops")
         rounds_list  = r.get("debate_rounds_per_loop") or []
@@ -253,7 +298,7 @@ def main():
         success      = bool(r.get("success"))
         first_pass   = success and loops == 1
 
-        tdir = task_dirs.get(idx)
+        tdir = find_task_dir(src_dir, idx)
         gen_steps = final_generated_steps(tdir) if tdir else None
         g = gt_steps.get(idx)
         delta = (gen_steps - g) if (gen_steps is not None and g is not None) else None
@@ -299,8 +344,10 @@ def main():
     def fmt(v, nd=3):
         return "  N/A" if v is None else f"{v:.{nd}f}"
 
+    label = (leaf_dirs[0].name if len(leaf_dirs) == 1
+             else f"{len(leaf_dirs)} runs merged")
     print("\n" + "=" * 64)
-    print(f"AGGREGATE METRICS  —  {root.name}")
+    print(f"AGGREGATE METRICS  —  {label}")
     print("=" * 64)
     print(f"Tasks evaluated:  {n_total}"
           + (f"   (+{n_err} error/skip records ignored)" if n_err else ""))
