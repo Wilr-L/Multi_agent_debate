@@ -296,7 +296,15 @@ def main():
         rounds_list  = r.get("debate_rounds_per_loop") or []
         conv_rounds  = rounds_list[0] if rounds_list else None
         success      = bool(r.get("success"))
-        first_pass   = success and loops == 1
+        # First-Pass Success: a record may set `first_pass_success` directly
+        # (SC needs this because it always draws all N samples so
+        # `debate_loops == 1` would never hold). Otherwise infer the usual
+        # way — first phase-2 / first sample / initial plan succeeded
+        # ⇔ debate_loops == 1 ∧ success.
+        if "first_pass_success" in r:
+            first_pass = bool(r["first_pass_success"])
+        else:
+            first_pass = success and loops == 1
 
         tdir = find_task_dir(src_dir, idx)
         gen_steps = final_generated_steps(tdir) if tdir else None

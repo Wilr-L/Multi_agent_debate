@@ -16,7 +16,8 @@
       "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_020504)",
       "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results)",
       "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_020504 evaluate_results/local_20260524_045350)",
-      "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_045350)"
+      "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_045350)",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_sc.py --help)"
     ]
   }
 }
