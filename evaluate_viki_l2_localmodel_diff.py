@@ -86,8 +86,10 @@ def _resolve_quant(args):
     return quant, load_format
 
 
-def _load_one_llm(model_path: str, args, label: str):
-    """Construct one vLLM LLM with the shared inference config."""
+def _load_one_llm(model_path: str, args, label: str, gpu_mem_util: float):
+    """Construct one vLLM LLM with the shared inference config and a
+    per-model GPU memory fraction (which is where the symmetric default
+    breaks down for asymmetric pairs like 7B + 72B)."""
     try:
         from vllm import LLM
     except ImportError as e:
@@ -100,7 +102,7 @@ def _load_one_llm(model_path: str, args, label: str):
 
     print(f"Loading {label}: {model_path}")
     print(f"  max_model_len={args.max_model_len}  "
-          f"gpu_mem_util={args.gpu_mem_util}  "
+          f"gpu_mem_util={gpu_mem_util}  "
           f"dtype={args.dtype}  tp={args.tensor_parallel_size}  "
           f"quantization={args.quantization or 'bf16'}  "
           f"load_format={load_format}")
@@ -109,7 +111,7 @@ def _load_one_llm(model_path: str, args, label: str):
     llm_kwargs = dict(
         model=model_path,
         max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_mem_util,
+        gpu_memory_utilization=gpu_mem_util,
         dtype=args.dtype,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
@@ -143,10 +145,17 @@ def parse_args():
     # vLLM args — applied to BOTH model loads (must be compatible with each)
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--gpu-mem-util", type=float, default=0.45,
-                   help="per-model GPU memory fraction. The two models share "
-                        "the same GPUs, so this value is claimed by EACH "
-                        "model — total = 2 × this. Default 0.45 so the pair "
-                        "fits under 0.90.")
+                   help="DEFAULT per-model GPU memory fraction, used for BOTH "
+                        "models unless --gpu-mem-util-1 / --gpu-mem-util-2 "
+                        "override. The two models share the same GPUs, so "
+                        "this value is claimed by EACH model — total = 2 × "
+                        "this. Default 0.45 (symmetric pair fits under 0.90).")
+    p.add_argument("--gpu-mem-util-1", type=float, default=None,
+                   help="override --gpu-mem-util for MODEL 1 (VLM1). Use this "
+                        "for asymmetric pairs — e.g. 7B + 72B on 4×80GB at "
+                        "TP=4 needs ~0.12 for 7B and ~0.60 for 72B.")
+    p.add_argument("--gpu-mem-util-2", type=float, default=None,
+                   help="override --gpu-mem-util for MODEL 2 (VLM2).")
     p.add_argument("--dtype", default="auto")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--trust-remote-code", action="store_true")
@@ -284,15 +293,23 @@ def main():
     # models have different tensor-parallel compatibility (head counts not
     # both divisible by TP), pick a TP that works for both — or run two
     # separate vLLM servers off-script.
+    # Per-model GPU memory shares (each defaults to --gpu-mem-util).
+    mem1 = args.gpu_mem_util_1 if args.gpu_mem_util_1 is not None else args.gpu_mem_util
+    mem2 = args.gpu_mem_util_2 if args.gpu_mem_util_2 is not None else args.gpu_mem_util
+
     print("=" * 70)
-    print("Loading 2 models (they will share the same GPU set)")
+    print(f"Loading 2 models (they will share the same GPU set)")
+    print(f"  per-model GPU memory: model1={mem1:.2f}  model2={mem2:.2f}  "
+          f"total={mem1 + mem2:.2f}")
     print("=" * 70)
-    if args.gpu_mem_util * 2 > 0.95:
-        print(f"[WARN] gpu_mem_util={args.gpu_mem_util} × 2 = "
-              f"{args.gpu_mem_util * 2:.2f} > 0.95 — likely to OOM "
-              f"loading the second model.")
-    llm1 = _load_one_llm(args.model_path_1, args, label="model 1 (VLM1, R1)")
-    llm2 = _load_one_llm(args.model_path_2, args, label="model 2 (VLM2, R2)")
+    if mem1 + mem2 > 0.95:
+        print(f"[WARN] mem1 + mem2 = {mem1 + mem2:.2f} > 0.95 — likely to "
+              f"OOM loading the second model.")
+
+    llm1 = _load_one_llm(args.model_path_1, args,
+                         label="model 1 (VLM1, R1)", gpu_mem_util=mem1)
+    llm2 = _load_one_llm(args.model_path_2, args,
+                         label="model 2 (VLM2, R2)", gpu_mem_util=mem2)
 
     sampling_params = SamplingParams(
         temperature=args.temperature,
