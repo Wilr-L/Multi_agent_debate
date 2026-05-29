@@ -34,6 +34,7 @@ Example:
 
 import argparse
 import json
+import random
 from collections import defaultdict
 from typing import Optional
 
@@ -58,11 +59,13 @@ def _plan_key(plan: Optional[TaskPlan]) -> Optional[str]:
         return None
 
 
-def _vote_winner(plans: list[Optional[TaskPlan]],
-                 execs: list[dict]) -> tuple[Optional[int], int]:
+def _vote_winner(plans: list[Optional[TaskPlan]]
+                 ) -> tuple[Optional[int], int]:
     """Plurality vote on plan content. Returns (winner_sample_idx, votes).
-    Ties broken by groups containing at least one successful execution,
-    then by lowest sample index. Returns (None, 0) if no parseable plan."""
+    When multiple plan groups tie at the top vote count, picks one at
+    RANDOM — deliberately NOT looking at simulator outcomes, because at
+    inference time a real SC system can't peek at execution results to
+    break ties. Returns (None, 0) if no plan parsed."""
     groups: dict[str, list[int]] = defaultdict(list)
     for i, p in enumerate(plans):
         k = _plan_key(p)
@@ -71,18 +74,14 @@ def _vote_winner(plans: list[Optional[TaskPlan]],
     if not groups:
         return None, 0
 
-    def group_score(idxs):
-        n_votes   = len(idxs)
-        any_ok    = int(any(execs[i].get("success") for i in idxs))
-        first_idx = -min(idxs)             # higher = earlier sample (we negate so max() prefers it)
-        return (n_votes, any_ok, first_idx)
-
-    winner_key = max(groups, key=lambda k: group_score(groups[k]))
+    max_votes  = max(len(idxs) for idxs in groups.values())
+    tied_keys  = [k for k, idxs in groups.items() if len(idxs) == max_votes]
+    winner_key = random.choice(tied_keys)
     winner_idxs = groups[winner_key]
-    # Within the winning group, prefer a successful sample as the "representative".
-    rep = next((i for i in winner_idxs if execs[i].get("success")),
-               winner_idxs[0])
-    return rep, len(winner_idxs)
+    # Within the winning group every sample has the SAME plan, hence the
+    # same execution outcome — picking any as the representative is fine;
+    # use the lowest sample index for log readability.
+    return winner_idxs[0], max_votes
 
 
 def run_one_task(task, llm, sampling_params, args, logger, stats):
@@ -131,7 +130,7 @@ def run_one_task(task, llm, sampling_params, args, logger, stats):
             print(f"  [SIM] sample {sample_idx + 1}: FAIL — {fl}")
 
     # ── Vote ──
-    winner_idx, votes = _vote_winner(plans, execs)
+    winner_idx, votes = _vote_winner(plans)
     n_succ = sum(1 for r in execs if r.get("success"))
 
     if winner_idx is None:
