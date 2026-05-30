@@ -19,7 +19,12 @@
       "Bash(E:/anaconda3/python.exe aggregate_metrics.py evaluate_results/local_20260524_045350)",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_sc.py --help)",
       "Bash(E:/anaconda3/python.exe recompute_sc_metrics.py evaluate_results/sc_20260529_001348 --verbose)",
-      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_localmodel_diff.py --help)"
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_localmodel_diff.py --help)",
+      "Bash(Get-ChildItem -Path \"E:\\\\KCL\\\\Multi_agent_debate\\\\evaluate_results\" -Directory)",
+      "Bash(Select-Object -ExpandProperty Name)",
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --verbose)",
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --per-dir)",
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --by goal)"
     ]
   }
 }
