@@ -24,7 +24,8 @@
       "Bash(Select-Object -ExpandProperty Name)",
       "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --verbose)",
       "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --per-dir)",
-      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --by goal)"
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --by goal)",
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results)"
     ]
   }
 }

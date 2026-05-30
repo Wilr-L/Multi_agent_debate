@@ -222,13 +222,11 @@ def _print_strat_block(label: str, rows: list[dict], which: str) -> None:
         print_strat_table("Accuracy by # total constraints (goal + temporal)",
                           stratify(rows, "n_constraints"))
     if which in ("goal", "all"):
-        if which == "goal":
-            print_strat_table("Accuracy by # goal constraints",
-                              stratify(rows, "n_goal"))
+        print_strat_table("Accuracy by # goal constraints",
+                          stratify(rows, "n_goal"))
     if which in ("temporal", "all"):
-        if which == "temporal":
-            print_strat_table("Accuracy by # temporal constraints",
-                              stratify(rows, "n_temporal"))
+        print_strat_table("Accuracy by # temporal constraints",
+                          stratify(rows, "n_temporal"))
 
 
 def main():
