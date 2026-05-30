@@ -3,7 +3,7 @@ evaluate_viki_l2_baseline
 =========================
 Run the **stock VIKI-Bench L2 single-VLM prompt** (verbatim from
 `VIKI-R/eval/VIKI-L2/qwen.py`) on the first N 2-robot tasks of
-`VIKI_data/viki/VIKI-L2/test.parquet`, calling SiliconFlow via the same
+`VIKI_data/viki/VIKI-L2/test.parquet`, calling APIMart via the same
 `VLMInterface` used by the debate pipeline. One API call per task; no
 debate, no reflection, no retry — this is the **no-debate baseline** to
 compare against `evaluate_viki_l2.py` (multi-agent debate).
@@ -19,7 +19,7 @@ For the baseline `loops` and `rounds` are flat 1's (or 0 on parse failure),
 making the contrast against debate's variable counts obvious in TB.
 
 Example:
-    $env:SILICONFLOW_API_KEY = "sk-..."
+    $env:APIMART_API_KEY = "sk-..."
     E:\\anaconda3\\python.exe evaluate_viki_l2_baseline.py --limit 20
 """
 
@@ -194,8 +194,8 @@ def fmt_stats(label: str, values: list) -> str:
 def main():
     args = parse_args()
 
-    if not os.environ.get("SILICONFLOW_API_KEY"):
-        print("[ERROR] SILICONFLOW_API_KEY is not set.", file=sys.stderr)
+    if not os.environ.get("APIMART_API_KEY"):
+        print("[ERROR] APIMART_API_KEY is not set.", file=sys.stderr)
         sys.exit(1)
 
     root = Path(__file__).resolve().parent

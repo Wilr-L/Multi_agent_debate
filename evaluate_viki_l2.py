@@ -14,7 +14,7 @@ terminal:
     tensorboard --logdir tb_logs
 
 Example:
-    $env:SILICONFLOW_API_KEY = "sk-..."
+    $env:APIMART_API_KEY = "sk-..."
     E:\\anaconda3\\python.exe evaluate_viki_l2.py --limit 20
 """
 
@@ -89,9 +89,9 @@ def fmt_stats(label: str, values: list) -> str:
 def main():
     args = parse_args()
 
-    if not os.environ.get("SILICONFLOW_API_KEY"):
-        print("[ERROR] SILICONFLOW_API_KEY is not set.", file=sys.stderr)
-        print("        On PowerShell:  $env:SILICONFLOW_API_KEY = 'sk-...'", file=sys.stderr)
+    if not os.environ.get("APIMART_API_KEY"):
+        print("[ERROR] APIMART_API_KEY is not set.", file=sys.stderr)
+        print("        On PowerShell:  $env:APIMART_API_KEY = 'sk-...'", file=sys.stderr)
         sys.exit(1)
 
     # ── Resolve paths ──

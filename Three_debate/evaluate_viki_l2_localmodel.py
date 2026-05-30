@@ -1,29 +1,28 @@
 """
-evaluate_viki_l2_localmodel
-===========================
-Same debate pipeline and reporting as `evaluate_viki_l2.py`, but the two
-debaters talk to a LOCAL VLM loaded with vLLM instead of the APIMart
-API. A single `vllm.LLM` instance is shared between VLM1 and VLM2 so the
-weights are only loaded into GPU memory once.
+evaluate_viki_l2_localmodel  (Three_debate variant)
+===================================================
+Three-agent version of the local-model debate evaluator. Three VLMs
+(VLM1, VLM2, VLM3) — all sharing ONE local vLLM `LLM` instance to keep
+the model weights loaded into GPU memory only ONCE — debate to produce
+a consensus plan for VIKI-L2 tasks with THREE active robots (R1+R2+R3).
 
-vLLM is the inference backend. Native Windows support is spotty — run this
-on Linux / WSL with a CUDA GPU. vLLM is imported lazily so `--help` still
-works on a Windows box without it installed.
+Filters the parquet for 3-robot tasks (the 2-agent sibling filters for
+2-robot tasks). VIKI-L2 has ~46 such tasks.
+
+vLLM is the inference backend. Native Windows support is spotty — run
+this on Linux / WSL with a CUDA GPU. vLLM is imported lazily so `--help`
+still works on a Windows box without it installed.
+
+results.json schema matches the 2-agent evaluator exactly so
+aggregate_metrics.py / stratified_acc.py work unchanged. TensorBoard
+tag names also match, so you can overlay 2-agent vs 3-agent runs.
 
 Example:
     python evaluate_viki_l2_localmodel.py \\
-        --model-path /models/Qwen3-VL-32B-Instruct \\
-        --limit 20 \\
-        --max-model-len 8192 \\
-        --gpu-mem-util 0.9 \\
-        --trust-remote-code
-
-    salloc -p gpu --gres=gpu:1 --ntasks=1 --cpus-per-task=8 --nodes=1 --time 240 --constraint a100
-    srun --pty /bin/bash -l
-    python evaluate_viki_l2_localmodel.py  --model-path /scratch/users/k25159491/WORK/Model/Qwen2.5-VL-3B-Instruct  --limit 20  --max-model-len 8192  --gpu-mem-util 0.9  --trust-remote-code
-
-TensorBoard scalars use the SAME tag names as evaluate_viki_l2.py /
-evaluate_viki_l2_baseline.py so all three runs overlay cleanly.
+        --model-path /scratch/.../Qwen2.5-VL-32B-Instruct \\
+        --tensor-parallel-size 4 --max-model-len 8192 --gpu-mem-util 0.9 \\
+        --enforce-eager --max-num-seqs 4 \\
+        --limit 20 --trust-remote-code
 """
 
 import argparse
@@ -125,9 +124,9 @@ class LocalVLMInterface:
       • query(user_prompt, image_path=None) -> str
       • reset_history()
 
-    Both VLM1 and VLM2 share the same `vllm.LLM` instance (one set of
-    weights on GPU). They keep independent `conversation_history` so the
-    two debaters remember their own turns.
+    All three of VLM1, VLM2, and VLM3 share the same `vllm.LLM` instance
+    (one set of weights on GPU). They keep independent
+    `conversation_history` so the three debaters remember their own turns.
     """
 
     def __init__(
@@ -238,7 +237,8 @@ class LocalVLMInterface:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Evaluate VIKI-L2 2-robot tasks against a LOCAL VLM (vLLM)")
+        description="Evaluate VIKI-L2 3-robot tasks against a LOCAL VLM "
+                    "(vLLM, 3-agent debate variant)")
 
     # Model / inference backend
     p.add_argument("--model-path", required=True,
@@ -299,7 +299,7 @@ def parse_args():
     p.add_argument("--parquet", default="VIKI_data/viki/VIKI-L2/test.parquet",
                    help="path to the VIKI-L2 parquet.")
     p.add_argument("--limit", type=int, default=None,
-                   help="evaluate only the first N 2-robot tasks "
+                   help="evaluate only the first N 3-robot tasks "
                         "(default: all).")
     p.add_argument("--offset", type=int, default=0,
                    help="skip the first OFFSET tasks (default 0).")
@@ -313,10 +313,10 @@ def parse_args():
     # Logging / output
     p.add_argument("--log-dir", default=None,
                    help="root dir for per-task VLM-call logs; defaults to "
-                        "logs/local_<timestamp>.")
+                        "logs/local3_<timestamp>.")
     p.add_argument("--tb-dir", default=None,
                    help="TensorBoard log dir; defaults to "
-                        "tb_logs/local_<timestamp>.")
+                        "tb_logs/local3_<timestamp>.")
     p.add_argument("--results-json", default=None,
                    help="path to dump per-task results JSON "
                         "(defaults to <log-dir>/results.json).")
@@ -364,18 +364,18 @@ def main():
         sys.exit(1)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    log_root = Path(args.log_dir) if args.log_dir else (root / "logs" / f"local_{stamp}")
+    log_root = Path(args.log_dir) if args.log_dir else (root / "logs" / f"local3_{stamp}")
     log_root.mkdir(parents=True, exist_ok=True)
-    tb_dir = Path(args.tb_dir) if args.tb_dir else (root / "tb_logs" / f"local_{stamp}")
+    tb_dir = Path(args.tb_dir) if args.tb_dir else (root / "tb_logs" / f"local3_{stamp}")
 
-    # ── Find tasks ──
-    print(f"Scanning parquet for 2-robot (R1+R2) tasks: {parquet_path}")
-    all_indices = find_task_indices(parquet_path, n_robots=2,
-                                    required_ids=("R1", "R2"))
+    # ── Find tasks (3-robot variant) ──
+    print(f"Scanning parquet for 3-robot (R1+R2+R3) tasks: {parquet_path}")
+    all_indices = find_task_indices(parquet_path, n_robots=3,
+                                    required_ids=("R1", "R2", "R3"))
     indices = all_indices[args.offset:]
     if args.limit is not None:
         indices = indices[:args.limit]
-    print(f"  → {len(all_indices)} total 2-robot tasks; evaluating {len(indices)} "
+    print(f"  → {len(all_indices)} total 3-robot tasks; evaluating {len(indices)} "
           f"(offset={args.offset}, limit={args.limit})")
 
     # ── TensorBoard ──
@@ -418,7 +418,7 @@ def main():
             load_format = "bitsandbytes"
     # 'fp8' / 'awq' / 'gptq' / 'bitsandbytes' → pass through verbatim
 
-    # ── Load model ONCE — both debaters share this LLM instance ──
+    # ── Load model ONCE — all three debaters share this LLM instance ──
     print(f"Loading local model with vLLM: {args.model_path}")
     print(f"  max_model_len={args.max_model_len}  "
           f"gpu_mem_util={args.gpu_mem_util}  "
@@ -477,7 +477,8 @@ def main():
 
         robot1 = RobotProfile(name=robots["R1"], robot_id="R1")
         robot2 = RobotProfile(name=robots["R2"], robot_id="R2")
-        # One shared stats accumulator — both debaters' calls feed it so
+        robot3 = RobotProfile(name=robots["R3"], robot_id="R3")
+        # One shared stats accumulator — all 3 debaters' calls feed it so
         # the per-task summary covers the whole debate.
         task_stats = TaskStats(
             max_tokens=int(args.max_tokens),
@@ -495,9 +496,15 @@ def main():
             role=DebateRole.VLM2_R2_ADVOCATE, logger=rlog,
             stats=task_stats,
         )
+        vlm3 = LocalVLMInterface(
+            llm=llm, sampling_params=sampling_params,
+            model_name=args.model_path,
+            role=DebateRole.VLM3_R3_ADVOCATE, logger=rlog,
+            stats=task_stats,
+        )
         sim = SimulatorInterface(scene_seed=0)
         eng = MultiAgentDebateEngine(
-            vlm1, vlm2, sim, robot1, robot2,
+            vlm1, vlm2, vlm3, sim, robot1, robot2, robot3,
             max_debate_rounds=args.max_debate_rounds,
             max_retry_rounds=args.max_retry_rounds,
         )

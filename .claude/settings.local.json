@@ -25,7 +25,15 @@
       "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --verbose)",
       "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --per-dir)",
       "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results --by goal)",
-      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results)"
+      "Bash(E:/anaconda3/python.exe stratified_acc.py evaluate_results)",
+      "Bash(E:/anaconda3/python.exe -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\''\\).read\\(\\)\\); print\\('\\\\''  syntax OK'\\\\''\\)')",
+      "Bash(E:/anaconda3/python.exe -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\'', encoding='\\\\''utf-8'\\\\''\\).read\\(\\)\\); print\\('\\\\''  syntax OK'\\\\''\\)')",
+      "Bash(mkdir -p Three_debate)",
+      "Bash(cp viki_loader.py Three_debate/)",
+      "Bash(cp multi_agent_debate.py Three_debate/)",
+      "Bash(cp evaluate_viki_l2_localmodel.py Three_debate/)",
+      "Bash(E:/anaconda3/python.exe -c 'import ast; ast.parse\\(open\\('\\\\''__TRACKED_VAR__'\\\\'', encoding='\\\\''utf-8'\\\\''\\).read\\(\\)\\); print\\(f'\\\\''__TRACKED_VAR__: syntax OK'\\\\''\\)')",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_localmodel.py --help)"
     ]
   }
 }

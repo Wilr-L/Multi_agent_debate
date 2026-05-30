@@ -1,18 +1,20 @@
 """
-Multi-Agent VLM Debate for Multi-Robot Task Planning
-=====================================================
-Built on VIKI-Bench. Two VLMs debate to produce a consensus task plan
-for heterogeneous robots (e.g., R1: fetch, R2: stompy).
+Three-Agent VLM Debate for Multi-Robot Task Planning  (Three_debate variant)
+============================================================================
+Built on VIKI-Bench. **THREE** VLMs debate to produce a consensus task plan
+for three heterogeneous robots (R1, R2, R3 — any VIKI embodiment combo).
+This is the 3-agent extension of the 2-agent debate one directory up.
 
 Pipeline:
-  Phase 1: Independent Proposal  — each VLM proposes sub-plan for its robot
-  Phase 2: Debate Loop           — alternating critiques until consensus
-  Phase 3: Execution             — run consensus plan in ManiSkill3 simulator
-  Phase 4: Reflection & Re-Debate — on failure, inject feedback and retry
+  Phase 1: Independent Proposal  — each of 3 VLMs proposes a joint plan
+  Phase 2: Debate Loop           — VLM1 → VLM2 → VLM3 rotation; consensus
+                                   reached when 3 CONSECUTIVE turns ACCEPT
+  Phase 3: Execution             — run consensus plan in symbolic simulator
+  Phase 4: Reflection & Re-Debate — on failure, all 3 reflect, merge revisions
 
 run:
 $env:APIMART_API_KEY = "sk-..."
-E:\anaconda3\python.exe multi_agent_debate.py
+E:\\anaconda3\\python.exe multi_agent_debate.py
 """
 
 import json
@@ -41,10 +43,19 @@ import requests
 #     modules); we never call the builtin here.
 # ─────────────────────────────────────────────
 
-_VIKI_EVAL_PARENT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "data-pipeline", "RoboFactory", "utils",
-)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+# `data-pipeline/RoboFactory/utils/eval/` may sit alongside this file OR
+# one directory up (the Three_debate variant lives in a subdir of the
+# main repo; data-pipeline is only at the root). Walk up at most 2 levels.
+_VIKI_EVAL_PARENT = None
+for base in (_THIS_DIR, os.path.dirname(_THIS_DIR), os.path.dirname(os.path.dirname(_THIS_DIR))):
+    cand = os.path.join(base, "data-pipeline", "RoboFactory", "utils")
+    if os.path.isdir(os.path.join(cand, "eval")):
+        _VIKI_EVAL_PARENT = cand
+        break
+if _VIKI_EVAL_PARENT is None:
+    raise ImportError("Could not locate data-pipeline/RoboFactory/utils/eval "
+                      "under this file's dir or its parents.")
 if _VIKI_EVAL_PARENT not in sys.path:
     sys.path.insert(0, _VIKI_EVAL_PARENT)
 
@@ -62,8 +73,9 @@ from itertools import combinations as _combinations         # noqa: E402
 # ─────────────────────────────────────────────
 
 class DebateRole(Enum):
-    VLM1_R1_ADVOCATE = "vlm1"   # advocates for R1 (e.g., fetch robot)
-    VLM2_R2_ADVOCATE = "vlm2"   # advocates for R2 (e.g., stompy robot)
+    VLM1_R1_ADVOCATE = "vlm1"   # advocates for R1
+    VLM2_R2_ADVOCATE = "vlm2"   # advocates for R2
+    VLM3_R3_ADVOCATE = "vlm3"   # advocates for R3 — Three_debate variant
 
 
 @dataclass
@@ -175,7 +187,8 @@ SYSTEM_PROMPT = """\
 You are a plan creator for a multi-robot team in VIKI-Bench. You are the ADVOCATE for \
 robot {robot_id} ({robot_name}). I will provide you with an image of the robots in a scene, \
 the available robots and their action primitives, and a task description. You need to debate \
-with the advocate for {partner_id} ({partner_name}) to jointly create a plan that completes the task.
+with the advocates for {partner_a_id} ({partner_a_name}) and {partner_b_id} ({partner_b_name}) \
+to jointly create a plan that completes the task.
 
 You must first analyze the image to fully understand the scene depicted. Then, analyze the task \
 description. Finally, propose / critique / revise the plan accordingly. Your reasoning must \
@@ -185,8 +198,10 @@ hypotheses, or guesses are allowed.
 ## Available robots and their action primitives
 - {robot_id} ({robot_name}): {robot_description}
   Available actions: {robot_avail_actions}
-- {partner_id} ({partner_name}): {partner_description}
-  Available actions: {partner_avail_actions}
+- {partner_a_id} ({partner_a_name}): {partner_a_description}
+  Available actions: {partner_a_avail_actions}
+- {partner_b_id} ({partner_b_name}): {partner_b_description}
+  Available actions: {partner_b_avail_actions}
 
 ## VIKI-Bench action primitives and rules
 Action must follow the following format as a JSON list, for example [\"Move\", \"plate\"] or [\"grasp\", \"banana\"]. It describes the single action that robot will perform in this step, with the following format: action_type, target_object_or_location\nAction primitives and descriptions: {{'Move': \"Command ['Move', 'object']: Robot R moves to the specified object.(Move to the object! Not move the object to other place!)\", 'Reach': \"Command ['Reach', 'object']: Robot R reaches the specified object.\", 'Grasp': \"Command ['Grasp', 'object']: Robot R's end effector performs a grasping operation on a specified object.\", 'Place': \"Command ['Place', 'object']: Place the thing held by the Robot R's end effector at a specified location ('object' means location).\", 'Open': \"Command ['Open', 'object']: Open the object held by the Robot R's end effector.\", 'Close': \"Command ['Close', 'object']: Close the object held by the Robot R's end effector.\", 'Push': \"Command ['Push', 'object', 'R1']: Robot R pushes the object to robot R1.\", 'Interact': \"Command ['Interact', 'object']: A general interaction operation, flexible for representing interactions with any asset.\"}}
@@ -205,14 +220,15 @@ Choose the primitive that advances the current object state, not just the task n
   - Note that the robot should not always wait throughout all steps.
 
 ## Your role
-You understand BOTH robots, but your primary responsibility is to ensure that {robot_id}'s \
-actions in the plan are feasible, efficient, and well-coordinated with {partner_id}. When \
-proposing or critiquing plans, pay special attention to:
+You understand ALL THREE robots, but your primary responsibility is to ensure that {robot_id}'s \
+actions in the plan are feasible, efficient, and well-coordinated with {partner_a_id} and \
+{partner_b_id}. When proposing or critiquing plans, pay special attention to:
 1. Whether {robot_id}'s assigned actions are within its **available action set** above.
-2. Whether the timing/sequencing avoids conflicts (e.g., both robots reaching for the same object).
-3. Whether {robot_id} could do certain tasks better than {partner_id}, or vice versa.
-4. **Each robot can only perform ONE action per time step.** Multiple robots may work in \
-   parallel but each is limited to one action per step.
+2. Whether the timing/sequencing avoids conflicts (e.g., two robots reaching for the same \
+object simultaneously, or one robot blocking another's path).
+3. Whether {robot_id} could do certain tasks better than {partner_a_id} / {partner_b_id}, or vice versa.
+4. **Each robot can only perform ONE action per time step.** All three robots may work in \
+parallel but each is limited to one action per step.
 
 ## Required output format (strict JSON)
 Every plan you output MUST follow this exact structure:
@@ -220,71 +236,20 @@ Every plan you output MUST follow this exact structure:
 {{
   "reasoning": "step-by-step chain of thought...",
   "steps": [
-    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"]}}}},
-    {{"step": 2, "actions": {{"R1": ["Reach", "pumpkin"], "R2": ["Reach", "apple"]}}}}
+    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"], "R3": ["Move", "box"]}}}},
+    {{"step": 2, "actions": {{"R1": ["Reach", "pumpkin"], "R2": ["Reach", "apple"], "R3": ["Reach", "box"]}}}}
   ]
 }}
 ```
 Rules:
 - `step` is the time step number (starts at 1, increments sequentially).
-- `actions` is a dict mapping robot id ("R1", "R2") to a list \
+- `actions` is a dict mapping robot id ("R1", "R2", "R3") to a list \
   `[action_type, target_object_or_location, (optional: extra_argument)]`.
 - Only use action primitives that are in that robot's "Available actions" list above.
 - If a robot has no action in a step, set its value to `["Wait"]`.
+- Every step MUST include an entry for every robot (use `["Wait"]` for idle).
 """
 
-
-
-SYSTEM_PROMPT0 = """\
-You are a plan creator for a multi-robot team in VIKI-Bench. You are the ADVOCATE for \
-robot {robot_id} ({robot_name}). I will provide you with an image of the robots in a scene, \
-the available robots and their action primitives, and a task description. You need to debate \
-with the advocate for {partner_id} ({partner_name}) to jointly create a plan that completes the task.
-
-You must first analyze the image to fully understand the scene depicted. Then, analyze the task \
-description. Finally, propose / critique / revise the plan accordingly. Your reasoning must \
-strictly adhere to the visual content of the image and the task description — no assumptions, \
-hypotheses, or guesses are allowed.
-
-## Available robots and their action primitives
-- {robot_id} ({robot_name}): {robot_description}
-  Available actions: {robot_avail_actions}
-- {partner_id} ({partner_name}): {partner_description}
-  Available actions: {partner_avail_actions}
-
-## VIKI-Bench action primitives and rules
-Action must follow the following format as a JSON list, for example [\"Move\", \"plate\"] or [\"grasp\", \"banana\"]. It describes the single action that robot will perform in this step, with the following format: action_type, target_object_or_location\nAction primitives and descriptions: {{'Move': \"Command ['Move', 'object']: Robot R moves to the specified object.(Move to the object! Not move the object to other place!)\", 'Reach': \"Command ['Reach', 'object']: Robot R reaches the specified object.\", 'Grasp': \"Command ['Grasp', 'object']: Robot R's end effector performs a grasping operation on a specified object.\", 'Place': \"Command ['Place', 'object']: Place the thing held by the Robot R's end effector at a specified location ('object' means location).\", 'Open': \"Command ['Open', 'object']: Open the object held by the Robot R's end effector.\", 'Close': \"Command ['Close', 'object']: Close the object held by the Robot R's end effector.\", 'Push': \"Command ['Push', 'object', 'R1']: Robot R pushes the object to robot R1.\", 'Interact': \"Command ['Interact', 'object']: A general interaction operation, flexible for representing interactions with any asset.\"}}
-Use exact object and location names from the task, relevant assets, and world state. Do not invent new entity names.
-Choose the primitive that advances the current object state, not just the task name.
-
-## Your role
-You understand BOTH robots, but your primary responsibility is to ensure that {robot_id}'s \
-actions in the plan are feasible, efficient, and well-coordinated with {partner_id}. When \
-proposing or critiquing plans, pay special attention to:
-1. Whether {robot_id}'s assigned actions are within its **available action set** above.
-2. Whether the timing/sequencing avoids conflicts (e.g., both robots reaching for the same object).
-3. Whether {robot_id} could do certain tasks better than {partner_id}, or vice versa.
-4. **Each robot can only perform ONE action per time step.** Multiple robots may work in \
-   parallel but each is limited to one action per step.
-
-## Required output format (strict JSON)
-Every plan you output MUST follow this exact structure:
-```json
-{{
-  "reasoning": "step-by-step chain of thought...",
-  "steps": [
-    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"]}}}},
-    {{"step": 2, "actions": {{"R1": ["Reach", "pumpkin"], "R2": ["Reach", "apple"]}}}}
-  ]
-}}
-```
-Rules:
-- `step` is the time step number (starts at 1, increments sequentially).
-- `actions` is a dict mapping robot id ("R1", "R2") to a list \
-  `[action_type, target_object_or_location, (optional: extra_argument)]`.
-- Only use action primitives that are in that robot's "Available actions" list above.
-- If a robot has no action in a step, set its value to `["Wait"]`.
-"""
 
 # ── 2.2 Phase 1: Independent Proposal Prompts ──
 
@@ -298,42 +263,47 @@ Look at the scene image carefully. Here is the task description:
 
 ## Instructions
 Propose a sub-plan focusing on what {robot_id} ({robot_name}) should do to help accomplish \
-this task. Also suggest what the partner robot {partner_id} ({partner_name}) should do, \
-based on your understanding of its capabilities. The initial world state above is the \
-ground truth for object positions, container open/closed status, and what each robot is \
-currently holding — your plan's pre-conditions must be consistent with it.
+this task. Also suggest what the partner robots {partner_a_id} ({partner_a_name}) and \
+{partner_b_id} ({partner_b_name}) should do, based on your understanding of their capabilities. \
+The initial world state above is the ground truth for object positions, container open/closed \
+status, and what each robot is currently holding — your plan's pre-conditions must be \
+consistent with it.
 
 Think step by step:
 1. What objects are visible in the scene? Where are they (cross-check against the world state)?
 2. What is the goal state?
 3. What actions does {robot_id} need to perform?
-4. What actions should {partner_id} perform in parallel?
-5. Are there any dependencies or ordering constraints?
+4. What actions should {partner_a_id} and {partner_b_id} perform in parallel?
+5. Are there any dependencies or ordering constraints between the three robots?
 
-Output the complete joint plan in the required JSON format.
+Output the complete joint plan in the required JSON format (every step must include all \
+three robots, using `["Wait"]` for any robot that is idle).
 """
 
 
 MERGE_PROMPT = """\
-## Your task — integrate two independent proposals into one joint plan
-You and {partner_id}'s advocate have each independently proposed a plan for the same task. \
-Your job now is to \
-combine the two proposals into a single coherent joint plan that will be the starting point \
-for debate.
+## Your task — integrate three independent proposals into one joint plan
+You and the advocates for {partner_a_id} and {partner_b_id} have each independently proposed \
+a plan for the same task. Your job now is to combine the three proposals into a single \
+coherent joint plan that will be the starting point for debate.
 
 ## Your own proposal (for {robot_id} = {robot_name})
 {plan_self_json}
 
-## The other advocate's proposal (for {partner_id} = {partner_name})
-{plan_other_json}
+## {partner_a_id}'s advocate's proposal (for {partner_a_id} = {partner_a_name})
+{plan_a_json}
+
+## {partner_b_id}'s advocate's proposal (for {partner_b_id} = {partner_b_name})
+{plan_b_json}
 
 Output ONLY the merged plan as a fresh plan in the standard JSON schema (do NOT use an \
-ACCEPT/REVISE verdict wrapper):
+ACCEPT/REVISE verdict wrapper). Every step MUST contain an entry for every robot \
+(`["Wait"]` if idle):
 ```json
 {{
-  "reasoning": "why you merged this way, including any conflict resolutions...",
+  "reasoning": "why you merged this way, including any conflict resolutions across the three plans...",
   "steps": [
-    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"]}}}}
+    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"], "R3": ["Wait"]}}}}
   ]
 }}
 ```
@@ -346,22 +316,24 @@ CRITIQUE_PROMPT = """\
 ## Current joint plan under review
 {current_plan_json}
 
-## The other advocate's critique
+## The most recent critique (from the advocate who spoke just before you)
 {other_critique}
 
 ## Debate history
 {debate_history}
 
 ## Your task
-You are developing a task plan by debating with {partner_id}'s advocate. Only a task plan that both parties ACCEPT will be implemented.
-Now Review the current plan and the other advocate's critique from the perspective of {robot_id} ({robot_name}). Evaluate:
+You are developing a task plan by debating with the advocates for {partner_a_id} and \
+{partner_b_id}. Only a task plan that all THREE advocates ACCEPT will be implemented.
+Now review the current plan and the other advocates' critiques from the perspective of \
+{robot_id} ({robot_name}). Evaluate:
 
 1. **Feasibility**: Can {robot_id} physically execute its assigned actions? \
    Check reachability, payload, manipulation type.
-2. **Efficiency**: Is there a better task allocation to save steps? Could {robot_id} do something \
-   currently assigned to {partner_id} more efficiently, or vice versa?
-3. **Coordination**: Are there timing conflicts? Will both robots try to access \
-   the same space or object simultaneously?
+2. **Efficiency**: Is there a better task allocation to save steps? Could {robot_id} take on \
+   something currently assigned to {partner_a_id} or {partner_b_id} (or vice versa) more efficiently?
+3. **Coordination**: Are there timing conflicts? Two robots reaching for the same object \
+   simultaneously? One robot blocking another's path?
 4. **Completeness**: Does the plan achieve the task goal? Are any steps missing?
 
 If the plan is acceptable, respond with:
@@ -369,7 +341,8 @@ If the plan is acceptable, respond with:
 {{"verdict": "ACCEPT", "reasoning": "why the plan is good"}}
 ```
 
-If you want to revise, respond with (steps follow the SYSTEM_PROMPT's nested `actions` schema):
+If you want to revise, respond with (steps follow the SYSTEM_PROMPT's nested `actions` schema \
+— every step must include all three robots):
 ```json
 {{
   "verdict": "REVISE",
@@ -377,7 +350,7 @@ If you want to revise, respond with (steps follow the SYSTEM_PROMPT's nested `ac
   "revised_plan": {{
     "reasoning": "...",
     "steps": [
-      {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Wait"]}}}}
+      {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Wait"], "R3": ["Move", "box"]}}}}
     ]
   }}
 }}
@@ -429,7 +402,7 @@ Output in the standard JSON plan format.
 #              OpenAI-style payload, including `image_url` parts for vision)
 #
 # Each VLMInterface instance keeps its own multi-turn conversation_history
-# so the two debaters maintain independent memories across rounds.
+# so all three debaters maintain independent memories across rounds.
 
 
 class RunLogger:
@@ -456,7 +429,7 @@ class RunLogger:
         if not readme.exists():
             readme.write_text(
                 "VLM call log. One file per chat-completion request, numbered\n"
-                "chronologically across both debaters (vlm1 = R1 advocate, vlm2 = R2).\n"
+                "chronologically across all three debaters (vlm1 = R1, vlm2 = R2, vlm3 = R3).\n"
                 "Each file shows the full message stack sent to the API plus the\n"
                 "model's reply. Images are summarized (not dumped as base64).\n",
                 encoding="utf-8",
@@ -1412,25 +1385,30 @@ class SimulatorInterface:
 
 class MultiAgentDebateEngine:
     """
-    Orchestrates the full debate pipeline:
-    Phase 1 → Phase 2 → Phase 3 → (Phase 4 if needed) → loop
+    Three-agent variant of the debate pipeline:
+    Phase 1 (3 proposals + merge) → Phase 2 (3-way rotating debate) →
+    Phase 3 → (Phase 4 with 3-way reflection if needed) → loop
     """
 
     def __init__(
         self,
         vlm1: VLMInterface,
         vlm2: VLMInterface,
+        vlm3: VLMInterface,
         simulator: SimulatorInterface,
-        robot1: RobotProfile = FETCH_PROFILE,
-        robot2: RobotProfile = STOMPY_PROFILE,
+        robot1: RobotProfile,
+        robot2: RobotProfile,
+        robot3: RobotProfile,
         max_debate_rounds: int = 5,
         max_retry_rounds: int = 3,
     ):
         self.vlm1 = vlm1
         self.vlm2 = vlm2
+        self.vlm3 = vlm3
         self.simulator = simulator
         self.robot1 = robot1
         self.robot2 = robot2
+        self.robot3 = robot3
         self.max_debate_rounds = max_debate_rounds
         self.max_retry_rounds = max_retry_rounds
 
@@ -1448,25 +1426,34 @@ class MultiAgentDebateEngine:
         return "\n".join(lines)
 
     def _init_vlm_system_prompts(self):
-        """Render and install the VIKI-flavored SYSTEM_PROMPT into each VLM,
-        with the advocate role swapped between the two."""
-        action_block = self._render_action_descriptions(self.robot1.name, self.robot2.name)
+        """Render and install the SYSTEM_PROMPT into each of the three VLMs,
+        with the advocate role rotated (each VLM is `self`, the other two
+        are `partner_a` and `partner_b`)."""
+        action_block = self._render_action_descriptions(
+            self.robot1.name, self.robot2.name, self.robot3.name)
 
-        def render(self_robot: RobotProfile, partner: RobotProfile) -> str:
+        def render(self_robot: RobotProfile,
+                   partner_a: RobotProfile,
+                   partner_b: RobotProfile) -> str:
             return SYSTEM_PROMPT.format(
                 robot_id=self_robot.robot_id,
                 robot_name=self_robot.name,
                 robot_description=self_robot.description,
                 robot_avail_actions=self_robot.available_actions,
-                partner_id=partner.robot_id,
-                partner_name=partner.name,
-                partner_description=partner.description,
-                partner_avail_actions=partner.available_actions,
+                partner_a_id=partner_a.robot_id,
+                partner_a_name=partner_a.name,
+                partner_a_description=partner_a.description,
+                partner_a_avail_actions=partner_a.available_actions,
+                partner_b_id=partner_b.robot_id,
+                partner_b_name=partner_b.name,
+                partner_b_description=partner_b.description,
+                partner_b_avail_actions=partner_b.available_actions,
                 action_descriptions=action_block,
             )
 
-        self.vlm1.set_system_prompt(render(self.robot1, self.robot2))
-        self.vlm2.set_system_prompt(render(self.robot2, self.robot1))
+        self.vlm1.set_system_prompt(render(self.robot1, self.robot2, self.robot3))
+        self.vlm2.set_system_prompt(render(self.robot2, self.robot1, self.robot3))
+        self.vlm3.set_system_prompt(render(self.robot3, self.robot1, self.robot2))
 
     @staticmethod
     def _compact_history_msg(content: str,
@@ -1533,100 +1520,104 @@ class MultiAgentDebateEngine:
         if not state.messages:
             return "(No previous debate messages)"
 
-        MAX_MESSAGES = 8     # covers phase1 ×3 + ~5 debate rounds
+        # Bumped from 8 → 10 in the 3-agent variant: a single Phase-2 round
+        # has 3 turns instead of 2, so a 3-round window now needs 9 slots
+        # plus a couple for Phase-1 proposals.
+        MAX_MESSAGES = 10
 
+        _role_to_label = {
+            DebateRole.VLM1_R1_ADVOCATE: f"VLM1({self.robot1.robot_id})",
+            DebateRole.VLM2_R2_ADVOCATE: f"VLM2({self.robot2.robot_id})",
+            DebateRole.VLM3_R3_ADVOCATE: f"VLM3({self.robot3.robot_id})",
+        }
         lines = []
         for msg in state.messages[-MAX_MESSAGES:]:
-            role_label = (f"VLM1({self.robot1.robot_id})"
-                          if msg.role == DebateRole.VLM1_R1_ADVOCATE
-                          else f"VLM2({self.robot2.robot_id})")
+            role_label = _role_to_label.get(msg.role, str(msg.role))
             content = self._compact_history_msg(msg.content)
             lines.append(f"[{role_label}]: {content}")
         return "\n\n".join(lines)
 
     # ── Phase 1: Independent Proposals ──
 
-    def phase1_independent_proposals(self, state: DebateState) -> tuple[TaskPlan, TaskPlan]:
-        """Each VLM independently proposes a plan from its robot's perspective."""
+    def phase1_independent_proposals(
+        self, state: DebateState
+    ) -> tuple[TaskPlan, TaskPlan, TaskPlan]:
+        """Each of the three VLMs independently proposes a plan from its
+        robot's perspective (with the other two robots framed as partners)."""
         print("\n" + "=" * 60)
-        print("PHASE 1: Independent Proposals")
+        print("PHASE 1: Independent Proposals (3 agents)")
         print("=" * 60)
 
         world_state = state.initial_world_state or "(unavailable)"
 
-        # VLM1 proposes
-        prompt1 = PROPOSAL_PROMPT.format(
-            task_description=state.task_description,
-            world_state=world_state,
-            robot_id=self.robot1.robot_id,
-            robot_name=self.robot1.name,
-            partner_id=self.robot2.robot_id,
-            partner_name=self.robot2.name,
-        )
-        response1 = self.vlm1.query(prompt1, image_path=state.scene_image_path)
-        plan1 = parse_plan_from_response(response1)
-        print(f"[VLM1] Proposed plan with {len(plan1.steps) if plan1 else 0} steps")
+        def propose(self_robot: RobotProfile,
+                    partner_a: RobotProfile,
+                    partner_b: RobotProfile,
+                    vlm: VLMInterface, label: str,
+                    role: DebateRole) -> Optional[TaskPlan]:
+            prompt = PROPOSAL_PROMPT.format(
+                task_description=state.task_description,
+                world_state=world_state,
+                robot_id=self_robot.robot_id,
+                robot_name=self_robot.name,
+                partner_a_id=partner_a.robot_id,
+                partner_a_name=partner_a.name,
+                partner_b_id=partner_b.robot_id,
+                partner_b_name=partner_b.name,
+            )
+            response = vlm.query(prompt, image_path=state.scene_image_path)
+            plan = parse_plan_from_response(response)
+            print(f"[{label}] Proposed plan with "
+                  f"{len(plan.steps) if plan else 0} steps")
+            state.messages.append(DebateMessage(
+                role=role, content=response, proposed_plan=plan,
+            ))
+            return plan
 
-        # VLM2 proposes
-        prompt2 = PROPOSAL_PROMPT.format(
-            task_description=state.task_description,
-            world_state=world_state,
-            robot_id=self.robot2.robot_id,
-            robot_name=self.robot2.name,
-            partner_id=self.robot1.robot_id,
-            partner_name=self.robot1.name,
-        )
-        response2 = self.vlm2.query(prompt2, image_path=state.scene_image_path)
-        plan2 = parse_plan_from_response(response2)
-        print(f"[VLM2] Proposed plan with {len(plan2.steps) if plan2 else 0} steps")
-
-        # Record in debate state
-        state.messages.append(DebateMessage(
-            role=DebateRole.VLM1_R1_ADVOCATE,
-            content=response1,
-            proposed_plan=plan1,
-        ))
-        state.messages.append(DebateMessage(
-            role=DebateRole.VLM2_R2_ADVOCATE,
-            content=response2,
-            proposed_plan=plan2,
-        ))
-
-        return plan1, plan2
+        plan1 = propose(self.robot1, self.robot2, self.robot3,
+                        self.vlm1, "VLM1", DebateRole.VLM1_R1_ADVOCATE)
+        plan2 = propose(self.robot2, self.robot1, self.robot3,
+                        self.vlm2, "VLM2", DebateRole.VLM2_R2_ADVOCATE)
+        plan3 = propose(self.robot3, self.robot1, self.robot2,
+                        self.vlm3, "VLM3", DebateRole.VLM3_R3_ADVOCATE)
+        return plan1, plan2, plan3
 
     def _merge_proposals(
         self,
         plan1: TaskPlan,
         plan2: TaskPlan,
+        plan3: TaskPlan,
         state: Optional[DebateState] = None,
     ) -> TaskPlan:
         """
-        Ask VLM1 (who will also speak first in Phase 2) to integrate the two
-        independent proposals into a single coherent joint plan via an LLM call.
-        This replaces the previous mechanical "take R1 from plan1, R2 from plan2"
-        rule with a model-driven merge that can resolve conflicts and pick the
-        better idea per robot.
+        Ask VLM1 (who will also speak first in Phase 2) to integrate the
+        THREE independent proposals into a single coherent joint plan via
+        an LLM call. Falls back to `_mechanical_merge` if VLM1's response
+        can't be parsed.
 
-        Falls back to `_mechanical_merge` only if VLM1's response can't be parsed.
-        If `state` is provided the merge turn is appended to `state.messages` so
-        the debate log stays complete.
+        VLM1 just authored `current_plan` — its first Phase-2 critique
+        would almost certainly be ACCEPT, so we set
+        `state.skip_vlm1_first_critique` to seed the consecutive-ACCEPT
+        counter at 1.
         """
-        plan_self_json  = json.dumps({"steps": plan1.steps}, indent=2)
-        plan_other_json = json.dumps({"steps": plan2.steps}, indent=2)
+        plan_self_json = json.dumps({"steps": plan1.steps}, indent=2)
+        plan_a_json    = json.dumps({"steps": plan2.steps}, indent=2)
+        plan_b_json    = json.dumps({"steps": plan3.steps}, indent=2)
 
         prompt = MERGE_PROMPT.format(
             plan_self_json=plan_self_json,
-            plan_other_json=plan_other_json,
+            plan_a_json=plan_a_json,
+            plan_b_json=plan_b_json,
             robot_id=self.robot1.robot_id,
             robot_name=self.robot1.name,
-            partner_id=self.robot2.robot_id,
-            partner_name=self.robot2.name,
+            partner_a_id=self.robot2.robot_id,
+            partner_a_name=self.robot2.name,
+            partner_b_id=self.robot3.robot_id,
+            partner_b_name=self.robot3.name,
         )
 
         # Stateless query() doesn't carry the image from prior turns,
-        # so we re-attach the scene image here. (Pre-stateless behavior
-        # assumed the image was still in VLM1's conversation_history
-        # from Phase 1, but that's no longer the path.)
+        # so we re-attach the scene image here.
         response = self.vlm1.query(
             prompt,
             image_path=state.scene_image_path if state else None,
@@ -1634,49 +1625,53 @@ class MultiAgentDebateEngine:
         merged = parse_plan_from_response(response)
 
         if merged is not None:
-            print(f"[VLM1] integrated proposals → {len(merged.steps)} steps")
+            print(f"[VLM1] integrated 3 proposals → {len(merged.steps)} steps")
             if state is not None:
                 state.messages.append(DebateMessage(
                     role=DebateRole.VLM1_R1_ADVOCATE,
                     content=response,
                     proposed_plan=merged,
                 ))
-                # VLM1 just authored `current_plan` — its first Phase-2 critique
-                # would almost certainly be ACCEPT. Tell phase2_debate to skip it.
                 state.skip_vlm1_first_critique = True
             return merged
 
         print("[WARN] VLM1 merge produced an unparseable plan; "
               "falling back to mechanical merge.")
-        return self._mechanical_merge(plan1, plan2)
+        return self._mechanical_merge(plan1, plan2, plan3)
 
-    def _mechanical_merge(self, plan1: TaskPlan, plan2: TaskPlan) -> TaskPlan:
+    def _mechanical_merge(self, plan1: TaskPlan, plan2: TaskPlan,
+                          plan3: TaskPlan) -> TaskPlan:
         """
         Fallback used only when the LLM-driven merge in `_merge_proposals`
-        returns an unparseable response. Old behavior: take R1's action from
-        plan1's step and R2's action from plan2's step, aligned by step index.
+        returns an unparseable response. Take R1's action from plan1, R2's
+        from plan2, R3's from plan3, aligned by step index. Missing entries
+        become `["Wait"]`.
         """
         r1_id = self.robot1.robot_id
         r2_id = self.robot2.robot_id
-        merged_steps = []
-        max_steps = max(len(plan1.steps), len(plan2.steps))
+        r3_id = self.robot3.robot_id
+        max_steps = max(len(plan1.steps), len(plan2.steps), len(plan3.steps))
 
+        merged_steps = []
         for i in range(max_steps):
             step1_actions = plan1.steps[i].get("actions", {}) if i < len(plan1.steps) else {}
             step2_actions = plan2.steps[i].get("actions", {}) if i < len(plan2.steps) else {}
+            step3_actions = plan3.steps[i].get("actions", {}) if i < len(plan3.steps) else {}
             merged_steps.append({
                 "step": i + 1,
                 "actions": {
                     r1_id: step1_actions.get(r1_id, ["Wait"]),
                     r2_id: step2_actions.get(r2_id, ["Wait"]),
+                    r3_id: step3_actions.get(r3_id, ["Wait"]),
                 },
             })
 
         return TaskPlan(
             steps=merged_steps,
             reasoning=(
-                f"Mechanical fallback merge from VLM1's {len(plan1.steps)}-step plan "
-                f"and VLM2's {len(plan2.steps)}-step plan."
+                f"Mechanical fallback merge from VLM1's {len(plan1.steps)}-step plan, "
+                f"VLM2's {len(plan2.steps)}-step plan, and "
+                f"VLM3's {len(plan3.steps)}-step plan."
             ),
             raw_text=json.dumps({"steps": merged_steps}, indent=2),
         )
@@ -1685,30 +1680,35 @@ class MultiAgentDebateEngine:
 
     def phase2_debate(self, state: DebateState) -> bool:
         """
-        Alternating debate. **Consensus = two CONSECUTIVE turns of ACCEPT**,
-        counted across round boundaries (any REVISE resets the streak to 0).
-        Example: round N VLM2 ACCEPTs + round N+1 VLM1 ACCEPTs → consensus.
+        Three-way rotating debate.
+        **Consensus = THREE CONSECUTIVE turns of ACCEPT** (one full sweep
+        of all three agents), counted across round boundaries (any REVISE
+        from any agent resets the streak to 0).
 
         Returns True if consensus reached (or max rounds exhausted, in which
         case the latest plan is taken as best-effort consensus).
 
         If `state.skip_vlm1_first_critique` is set (by `_merge_proposals`),
         round 1 starts directly with VLM2 — VLM1's first critique is treated
-        as an implicit ACCEPT (it just authored `current_plan`, so asking it
-        to critique itself would burn an API call for a near-certain ACCEPT).
-        The implicit ACCEPT seeds the consecutive-ACCEPT counter to 1.
-        From round 2 onward, normal VLM1→VLM2 alternation resumes.
+        as an implicit ACCEPT (it just authored `current_plan`). The implicit
+        ACCEPT seeds the consecutive-ACCEPT counter to 1, so consensus is
+        reachable on round 1 if VLM2 and VLM3 both ACCEPT.
+        From round 2 onward, normal VLM1→VLM2→VLM3 rotation resumes.
         """
         print("\n" + "=" * 60)
-        print("PHASE 2: Debate Loop")
+        print("PHASE 2: Debate Loop (3-way rotation)")
         print("=" * 60)
 
-        # `last_critique` carries the previous advocate's full response into
-        # the next turn's `{other_critique}` slot — persists across rounds.
+        # `last_critique` carries the IMMEDIATELY-previous advocate's full
+        # response into the next turn's `{other_critique}` slot — persists
+        # across rounds. The full debate history is also visible via
+        # `_format_debate_history` so a VLM can see what the OTHER partners
+        # said too, not just the most recent.
         last_critique: Optional[str] = None
 
-        # Cross-round counter — consensus iff this hits 2.
+        # Cross-round counter — consensus iff this hits 3.
         consecutive_accepts = 0
+        CONSENSUS_REQUIRED = 3
 
         # Consume the skip flag set by _merge_proposals.
         skip_vlm1_round1 = state.skip_vlm1_first_critique
@@ -1722,12 +1722,15 @@ class MultiAgentDebateEngine:
                     last_critique = msg.content
                     break
 
-        # Alternating turn order for every round: (VLM1 → VLM2).
+        # Rotating turn order: (VLM1 → VLM2 → VLM3). Each tuple is
+        # (vlm, self_robot, partner_a, partner_b, role, label).
         turn_order = [
-            (self.vlm1, self.robot1, self.robot2,
+            (self.vlm1, self.robot1, self.robot2, self.robot3,
              DebateRole.VLM1_R1_ADVOCATE, "VLM1"),
-            (self.vlm2, self.robot2, self.robot1,
+            (self.vlm2, self.robot2, self.robot1, self.robot3,
              DebateRole.VLM2_R2_ADVOCATE, "VLM2"),
+            (self.vlm3, self.robot3, self.robot1, self.robot2,
+             DebateRole.VLM3_R3_ADVOCATE, "VLM3"),
         ]
 
         for round_idx in range(self.max_debate_rounds):
@@ -1737,7 +1740,7 @@ class MultiAgentDebateEngine:
             # Round 1 only: if VLM1 just authored current_plan via merge,
             # skip its turn and seed the streak at 1.
             if round_idx == 0 and skip_vlm1_round1:
-                this_round_turns = turn_order[1:]      # VLM2 only
+                this_round_turns = turn_order[1:]      # VLM2 + VLM3
                 consecutive_accepts = 1                # VLM1's implicit accept
                 print("[VLM1] (implicit ACCEPT — just authored the merged plan)")
                 state.messages.append(DebateMessage(
@@ -1749,7 +1752,8 @@ class MultiAgentDebateEngine:
             else:
                 this_round_turns = turn_order
 
-            for current_vlm, current_robot, partner_robot, role, label in this_round_turns:
+            for (current_vlm, current_robot, partner_a, partner_b,
+                 role, label) in this_round_turns:
                 # Re-serialize the *latest* plan — if the previous turn
                 # REVISEd, this advocate sees the updated draft.
                 current_plan_json = json.dumps(
@@ -1764,7 +1768,8 @@ class MultiAgentDebateEngine:
                     debate_history=debate_history,
                     robot_id=current_robot.robot_id,
                     robot_name=current_robot.name,
-                    partner_id=partner_robot.robot_id,
+                    partner_a_id=partner_a.robot_id,
+                    partner_b_id=partner_b.robot_id,
                 )
                 response = current_vlm.query(prompt, image_path=state.scene_image_path)
                 accepts = is_accept_response(response)
@@ -1777,22 +1782,23 @@ class MultiAgentDebateEngine:
                     accepts_current_plan=accepts,
                 ))
                 print(f"[{label}] {'ACCEPTS' if accepts else 'REVISES'}  "
-                      f"(streak {consecutive_accepts + 1 if accepts else 0})")
+                      f"(streak {consecutive_accepts + 1 if accepts else 0}/"
+                      f"{CONSENSUS_REQUIRED})")
 
                 # On REVISE, swap in the new plan immediately so the *next*
-                # turn (next advocate, or next round's VLM1) sees the
-                # revised version in `{current_plan_json}`.
+                # turn sees the revised version in `{current_plan_json}`.
                 if new_plan and not accepts:
                     state.current_plan = new_plan
 
                 last_critique = response
 
-                # ── Consensus: two CONSECUTIVE ACCEPTs (any REVISE resets) ──
+                # ── Consensus: THREE CONSECUTIVE ACCEPTs (any REVISE resets) ──
                 if accepts:
                     consecutive_accepts += 1
-                    if consecutive_accepts >= 2:
+                    if consecutive_accepts >= CONSENSUS_REQUIRED:
                         state.consensus_reached = True
-                        print("\n>>> CONSENSUS REACHED (two consecutive ACCEPTs) <<<")
+                        print(f"\n>>> CONSENSUS REACHED "
+                              f"({CONSENSUS_REQUIRED} consecutive ACCEPTs) <<<")
                         return True
                 else:
                     consecutive_accepts = 0
@@ -1824,9 +1830,11 @@ class MultiAgentDebateEngine:
     # ── Phase 4: Reflection & Re-Debate ──
 
     def phase4_reflection(self, state: DebateState, exec_result: dict):
-        """Both VLMs reflect on execution failure and propose fixes."""
+        """All THREE VLMs reflect on execution failure and propose fixes;
+        the three revisions are then merged via VLM1 (same path as the
+        Phase-1 merge)."""
         print("\n" + "=" * 60)
-        print("PHASE 4: Reflection on Failure")
+        print("PHASE 4: Reflection on Failure (3-way)")
         print("=" * 60)
 
         # Build execution feedback string
@@ -1847,45 +1855,49 @@ class MultiAgentDebateEngine:
 
         failed_plan_json = json.dumps({"steps": state.current_plan.steps}, indent=2)
 
-        # ── VLM1 reflects ──
-        reflect_prompt_1 = REFLECTION_PROMPT.format(
-            execution_feedback=feedback,
-            failed_plan_json=failed_plan_json,
-            debate_summary=debate_summary,
-            robot_id=self.robot1.robot_id,
-        )
-        response1 = self.vlm1.query(reflect_prompt_1, image_path=state.scene_image_path)
-        new_plan1 = parse_plan_from_response(response1)
-        state.messages.append(DebateMessage(
-            role=DebateRole.VLM1_R1_ADVOCATE,
-            content=response1,
-            proposed_plan=new_plan1,
-        ))
-        print(f"[VLM1] Reflection complete, proposed revision: {new_plan1 is not None}")
+        def reflect(vlm: VLMInterface, robot: RobotProfile,
+                    role: DebateRole, label: str) -> Optional[TaskPlan]:
+            prompt = REFLECTION_PROMPT.format(
+                execution_feedback=feedback,
+                failed_plan_json=failed_plan_json,
+                debate_summary=debate_summary,
+                robot_id=robot.robot_id,
+            )
+            response = vlm.query(prompt, image_path=state.scene_image_path)
+            new_plan = parse_plan_from_response(response)
+            state.messages.append(DebateMessage(
+                role=role, content=response, proposed_plan=new_plan,
+            ))
+            print(f"[{label}] Reflection complete, proposed revision: "
+                  f"{new_plan is not None}")
+            return new_plan
 
-        # ── VLM2 reflects ──
-        reflect_prompt_2 = REFLECTION_PROMPT.format(
-            execution_feedback=feedback,
-            failed_plan_json=failed_plan_json,
-            debate_summary=debate_summary,
-            robot_id=self.robot2.robot_id,
-        )
-        response2 = self.vlm2.query(reflect_prompt_2, image_path=state.scene_image_path)
-        new_plan2 = parse_plan_from_response(response2)
-        state.messages.append(DebateMessage(
-            role=DebateRole.VLM2_R2_ADVOCATE,
-            content=response2,
-            proposed_plan=new_plan2,
-        ))
-        print(f"[VLM2] Reflection complete, proposed revision: {new_plan2 is not None}")
+        new_plan1 = reflect(self.vlm1, self.robot1,
+                            DebateRole.VLM1_R1_ADVOCATE, "VLM1")
+        new_plan2 = reflect(self.vlm2, self.robot2,
+                            DebateRole.VLM2_R2_ADVOCATE, "VLM2")
+        new_plan3 = reflect(self.vlm3, self.robot3,
+                            DebateRole.VLM3_R3_ADVOCATE, "VLM3")
 
-        # Merge reflections into a new starting plan
-        if new_plan1 and new_plan2:
-            state.current_plan = self._merge_proposals(new_plan1, new_plan2, state)
-        elif new_plan1:
-            state.current_plan = new_plan1
-        elif new_plan2:
-            state.current_plan = new_plan2
+        # Merge whatever subset parsed. We need >=1 plan; if all 3 parsed,
+        # do a full 3-way merge; if only 2 parsed, mechanical-merge the
+        # missing one's slot from the still-failed plan; if only 1 parsed,
+        # use it directly.
+        survivors = [p for p in (new_plan1, new_plan2, new_plan3) if p is not None]
+        if len(survivors) == 3:
+            state.current_plan = self._merge_proposals(
+                new_plan1, new_plan2, new_plan3, state)
+        elif len(survivors) == 2:
+            # Stand in for the missing one with the prior failed plan so
+            # the merge still sees 3 inputs (this preserves that robot's
+            # actions if no one revised them).
+            fill = state.current_plan
+            p1 = new_plan1 or fill
+            p2 = new_plan2 or fill
+            p3 = new_plan3 or fill
+            state.current_plan = self._merge_proposals(p1, p2, p3, state)
+        elif len(survivors) == 1:
+            state.current_plan = survivors[0]
         # else: keep the old plan (shouldn't happen)
 
     # ── Main Pipeline ──
@@ -1918,7 +1930,7 @@ class MultiAgentDebateEngine:
         state = DebateState(
             task_description=task_description,
             scene_image_path=scene_image_path,
-            robot_profiles=[self.robot1, self.robot2],
+            robot_profiles=[self.robot1, self.robot2, self.robot3],
             initial_world_state=initial_world_state,
         )
         execution_results = []
@@ -1927,19 +1939,21 @@ class MultiAgentDebateEngine:
         # consensus before being handed to Phase 3.
         debate_rounds_per_loop: list[int] = []
 
-        # Phase 1: Independent proposals + merge
-        plan1, plan2 = self.phase1_independent_proposals(state)
-        if plan1 is None or plan2 is None:
-            print("[ERROR] One or both VLMs failed to produce a valid plan.")
-            # Fallback: use whichever plan was produced
-            state.current_plan = plan1 or plan2
-            if state.current_plan is None:
-                return {
-                    "success": False, "error": "Both VLMs failed to produce plans",
-                    "debate_loop_count": 0, "debate_rounds_per_loop": [],
-                }
+        # Phase 1: Independent proposals (3 of them) + merge
+        plan1, plan2, plan3 = self.phase1_independent_proposals(state)
+        survivors = [p for p in (plan1, plan2, plan3) if p is not None]
+        if len(survivors) == 0:
+            print("[ERROR] All three VLMs failed to produce a valid plan.")
+            return {
+                "success": False, "error": "All VLMs failed to produce plans",
+                "debate_loop_count": 0, "debate_rounds_per_loop": [],
+            }
+        elif len(survivors) < 3:
+            print(f"[WARN] Only {len(survivors)}/3 VLMs produced parseable plans; "
+                  f"using survivors as starting point (no full 3-way merge).")
+            state.current_plan = survivors[0]
         else:
-            state.current_plan = self._merge_proposals(plan1, plan2, state)
+            state.current_plan = self._merge_proposals(plan1, plan2, plan3, state)
 
         print(f"\nMerged plan has {len(state.current_plan.steps)} steps")
 
@@ -2002,7 +2016,7 @@ def main():
     )
     parser.add_argument(
         "--idx", type=int, default=None,
-        help="row index to run; default = first 2-robot (R1+R2) task in the parquet",
+        help="row index to run; default = first 3-robot (R1+R2+R3) task in the parquet",
     )
     parser.add_argument(
         "--max-debate-rounds", type=int, default=3,
@@ -2038,10 +2052,10 @@ def main():
         return
 
     if args.idx is None:
-        candidates = find_task_indices(parquet_path, n_robots=2,
-                                       required_ids=("R1", "R2"), limit=1)
+        candidates = find_task_indices(parquet_path, n_robots=3,
+                                       required_ids=("R1", "R2", "R3"), limit=1)
         if not candidates:
-            print("[ERROR] No 2-robot (R1+R2) tasks found in the parquet.")
+            print("[ERROR] No 3-robot (R1+R2+R3) tasks found in the parquet.")
             return
         idx = candidates[0]
     else:
@@ -2057,14 +2071,15 @@ def main():
     print()
 
     # ── Build RobotProfiles dynamically from the parquet's `robots` dict ──
-    # (R1/R2 may be any VIKI embodiment — not just fetch/stompy.)
-    if "R1" not in robots or "R2" not in robots:
-        print(f"[ERROR] Task #{idx} does not have both R1 and R2; got {robots}")
+    # (R1/R2/R3 may be any VIKI embodiment — not hardcoded.)
+    if not all(robots.get(rid) for rid in ("R1", "R2", "R3")):
+        print(f"[ERROR] Task #{idx} does not have all of R1/R2/R3; got {robots}")
         return
     robot1 = RobotProfile(name=robots["R1"], robot_id="R1")
     robot2 = RobotProfile(name=robots["R2"], robot_id="R2")
+    robot3 = RobotProfile(name=robots["R3"], robot_id="R3")
 
-    # ── Set up VLM call logger (shared by both debaters) ──
+    # ── Set up VLM call logger (shared by all three debaters) ──
     logger = None
     if not args.no_log:
         log_dir = Path(args.log_dir) if args.log_dir else (
@@ -2076,11 +2091,12 @@ def main():
     # ── Instantiate VLMs + simulator + engine ──
     vlm1 = VLMInterface(role=DebateRole.VLM1_R1_ADVOCATE, logger=logger)
     vlm2 = VLMInterface(role=DebateRole.VLM2_R2_ADVOCATE, logger=logger)
+    vlm3 = VLMInterface(role=DebateRole.VLM3_R3_ADVOCATE, logger=logger)
     simulator = SimulatorInterface(scene_seed=0)
 
     engine = MultiAgentDebateEngine(
-        vlm1=vlm1, vlm2=vlm2, simulator=simulator,
-        robot1=robot1, robot2=robot2,
+        vlm1=vlm1, vlm2=vlm2, vlm3=vlm3, simulator=simulator,
+        robot1=robot1, robot2=robot2, robot3=robot3,
         max_debate_rounds=args.max_debate_rounds,
         max_retry_rounds=args.max_retry_rounds,
     )
