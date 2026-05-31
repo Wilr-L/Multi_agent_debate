@@ -1,7 +1,5 @@
 #!/bin/bash
 #SBATCH -J python
-#SBATCH -N 1
-#SBATCH -p a01
 #SBATCH -o stdout.%j
 #SBATCH -e stderr.%j
 #SBATCH --no-requeue
