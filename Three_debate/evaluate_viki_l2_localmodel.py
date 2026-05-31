@@ -296,7 +296,7 @@ def parse_args():
                    help="max generated tokens per call (default 4096).")
 
     # Evaluation set
-    p.add_argument("--parquet", default="VIKI_data/viki/VIKI-L2/test.parquet",
+    p.add_argument("--parquet", default="/home/fit/liuying/WORK/LIZHI/Multi_agent_debate/VIKI_data/viki/VIKI-L2/test.parquet",
                    help="path to the VIKI-L2 parquet.")
     p.add_argument("--limit", type=int, default=None,
                    help="evaluate only the first N 3-robot tasks "
