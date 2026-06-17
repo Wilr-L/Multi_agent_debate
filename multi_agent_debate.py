@@ -578,6 +578,11 @@ class VLMInterface:
             "temperature": self.temperature,
             "max_tokens":  self.max_tokens,
             "top_p":       self.top_p,
+            # Explicitly disable SSE streaming — APIMart proxies (and
+            # OpenAI through them) sometimes default gpt-4o to streaming;
+            # we want one consolidated JSON response. If APIMart still
+            # streams despite this, _post_with_retry parses the SSE.
+            "stream":      False,
             **self.extra_params,
         }
 
@@ -765,8 +770,76 @@ class VLMInterface:
             ],
         }
 
+    @staticmethod
+    def _parse_sse_response(body: str) -> dict:
+        """Reconstruct a non-streaming OpenAI-style chat-completion response
+        from an SSE (text/event-stream) body. Each non-empty `data: {...}`
+        line is one delta chunk; we concatenate `delta.content` (and
+        `delta.reasoning_content` for thinking-mode models) across all
+        chunks and return a dict in the SAME shape as a non-streaming
+        response so the rest of the code path doesn't need to know."""
+        full_content   = ""
+        full_reasoning = ""
+        finish_reason  = None
+        model_name     = None
+        last_usage     = None
+        last_id        = None
+        for line in body.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            last_id    = chunk.get("id", last_id)
+            model_name = chunk.get("model", model_name)
+            if chunk.get("usage"):
+                last_usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            ch0   = choices[0]
+            delta = ch0.get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                full_content += piece
+            rpiece = delta.get("reasoning_content")
+            if rpiece:
+                full_reasoning += rpiece
+            if ch0.get("finish_reason"):
+                finish_reason = ch0["finish_reason"]
+
+        msg: dict = {"role": "assistant", "content": full_content}
+        if full_reasoning:
+            msg["reasoning_content"] = full_reasoning
+        return {
+            "id":      last_id,
+            "object":  "chat.completion",
+            "model":   model_name,
+            "choices": [{
+                "index": 0,
+                "message": msg,
+                "finish_reason": finish_reason,
+            }],
+            "usage": last_usage,
+        }
+
     def _post_with_retry(self, path: str, payload: dict) -> dict:
-        """POST with simple exponential backoff on 429 / 5xx / network errors."""
+        """POST with simple exponential backoff on:
+          - network errors
+          - 429 / 5xx HTTP responses
+          - HTTP 200 with EMPTY or non-JSON body (provider hiccup / wrong
+            endpoint / HTML error page proxied).
+
+        SSE responses (text/event-stream) — which some APIMart proxies
+        return even when `stream: false` is in the payload — are parsed
+        in-place via `_parse_sse_response` and a synthetic non-streaming
+        dict is returned. No retry needed for SSE since it's a stable
+        server behavior, not a transient hiccup."""
         url = f"{self.base_url}{path}"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -778,13 +851,50 @@ class VLMInterface:
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             except requests.RequestException as e:
                 last_err = f"network error: {e}"
+                print(f"[WARN] {last_err}; retrying in {2 ** attempt}s "
+                      f"({attempt + 1}/{self.max_retries})", file=sys.stderr)
                 time.sleep(2 ** attempt)
                 continue
 
             if resp.status_code == 200:
-                return resp.json()
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+
+                # SSE: APIMart streamed despite `stream: false`. Parse and
+                # synthesize a non-streaming response. Stable behavior →
+                # no retry, will recur every time.
+                if "text/event-stream" in content_type:
+                    body = resp.text or ""
+                    try:
+                        return self._parse_sse_response(body)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"APIMart returned SSE that we couldn't parse: {e}. "
+                            f"body[:500]={body[:500]!r}"
+                        )
+
+                try:
+                    return resp.json()
+                except ValueError as e:
+                    # HTTP 200 but body wasn't JSON AND not SSE — usually
+                    # empty body (transient backend hiccup). Show the user
+                    # what came back, then retry.
+                    body = resp.text or ""
+                    body_preview = body[:500].replace("\n", "\\n")
+                    last_err = (
+                        f"HTTP 200 but body wasn't JSON ({e}). "
+                        f"content-type={content_type!r}, length={len(body)}, "
+                        f"body[:500]={body_preview!r}"
+                    )
+                    print(f"[WARN] {last_err}\n       retrying in "
+                          f"{2 ** attempt}s ({attempt + 1}/{self.max_retries})",
+                          file=sys.stderr)
+                    time.sleep(2 ** attempt)
+                    continue
+
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                print(f"[WARN] {last_err}; retrying in {2 ** attempt}s "
+                      f"({attempt + 1}/{self.max_retries})", file=sys.stderr)
                 time.sleep(2 ** attempt)
                 continue
             # Non-retryable (400, 401, 403, 404, ...) — surface immediately.
@@ -792,7 +902,8 @@ class VLMInterface:
                 f"APIMart API error {resp.status_code}: {resp.text[:500]}"
             )
         raise RuntimeError(
-            f"APIMart API failed after {self.max_retries} attempts. Last error: {last_err}"
+            f"APIMart API failed after {self.max_retries} attempts. "
+            f"Last error: {last_err}"
         )
 
 
@@ -1991,9 +2102,85 @@ class MultiAgentDebateEngine:
 # 7. Example Usage
 # ─────────────────────────────────────────────
 
+def _run_one_task_demo(idx: int, parquet_path: Path, args, log_dir: Path):
+    """Run the engine on a single task and print a per-task report.
+    Returns a dict {"idx": ..., "success": bool, ...} for aggregation."""
+    from viki_loader import load_viki_task
+
+    try:
+        task = load_viki_task(parquet_path, idx)
+    except Exception as e:
+        print(f"[SKIP] idx={idx}: load failed: {e}")
+        return {"idx": idx, "error": f"load failed: {e}"}
+
+    robots = task["scene_config"]["robots"]
+    print(f"\n=== VIKI-L2 task #{idx} (task_id={task['task_id']}) ===")
+    print(f"name        : {task['task_name']}")
+    print(f"robots      : {robots}")
+    print(f"description : {task['task_description']}")
+    print(f"image       : {task['image_path']}")
+
+    if "R1" not in robots or "R2" not in robots:
+        print(f"[SKIP] Task #{idx} does not have both R1 and R2; got {robots}")
+        return {"idx": idx, "error": "missing R1/R2"}
+    robot1 = RobotProfile(name=robots["R1"], robot_id="R1")
+    robot2 = RobotProfile(name=robots["R2"], robot_id="R2")
+
+    # Each task gets its own RunLogger subdir so logs don't interleave.
+    rlog = None
+    if not args.no_log:
+        rlog = RunLogger(log_dir / f"task_{idx:05d}_{task['task_id']}")
+
+    vlm1 = VLMInterface(role=DebateRole.VLM1_R1_ADVOCATE, logger=rlog)
+    vlm2 = VLMInterface(role=DebateRole.VLM2_R2_ADVOCATE, logger=rlog)
+    simulator = SimulatorInterface(scene_seed=0)
+    engine = MultiAgentDebateEngine(
+        vlm1=vlm1, vlm2=vlm2, simulator=simulator,
+        robot1=robot1, robot2=robot2,
+        max_debate_rounds=args.max_debate_rounds,
+        max_retry_rounds=args.max_retry_rounds,
+    )
+
+    result = engine.run(
+        task["task_description"], task["image_path"], task["scene_config"]
+    )
+
+    success = bool(result.get("success"))
+    print("\n--- task result ---")
+    print(f"Success:        {success}")
+    print(f"Debate rounds:  {result.get('total_debate_rounds')}")
+    print(f"Retry rounds:   {result.get('total_retry_rounds')}")
+    if result.get("final_plan"):
+        print(f"Final plan ({len(result['final_plan'].steps)} steps):")
+        for step in result["final_plan"].steps:
+            actions = step.get("actions", {})
+            parts = ", ".join(f"{rid}={act}" for rid, act in actions.items())
+            print(f"  Step {step['step']}: {parts}")
+    last_exec = (result.get("execution_results") or [{}])[-1]
+    if last_exec:
+        m = last_exec.get("metrics", {})
+        print(f"Metrics: activation={m.get('agent_activation_score', 0):.2f}  "
+              f"planning={m.get('task_planning_score', 0):.2f}  "
+              f"trajectory={m.get('trajectory_score', 0):.2f}")
+        if not success and last_exec.get("failure_reason"):
+            print(f"Failure: step {last_exec.get('failure_step')} — "
+                  f"{last_exec['failure_reason'].splitlines()[0]}")
+
+    return {
+        "idx":             idx,
+        "task_id":         task["task_id"],
+        "success":         success,
+        "debate_loops":    int(result.get("debate_loop_count", 0)),
+        "debate_rounds_per_loop": list(result.get("debate_rounds_per_loop", [])),
+        "last_failure":    (last_exec.get("failure_reason") if last_exec else None),
+    }
+
+
 def main():
-    """Run the debate pipeline on one task drawn from VIKI-L2/test.parquet."""
+    """Run the debate pipeline on one task (`--idx`) or the FIRST N tasks
+    (`--limit N`) drawn from VIKI-L2/test.parquet."""
     import argparse
+    import statistics
 
     parser = argparse.ArgumentParser(description="VIKI-L2 multi-agent-debate demo")
     parser.add_argument(
@@ -2002,7 +2189,19 @@ def main():
     )
     parser.add_argument(
         "--idx", type=int, default=None,
-        help="row index to run; default = first 2-robot (R1+R2) task in the parquet",
+        help="row index to run as a SINGLE task; default = first 2-robot "
+             "(R1+R2) task in the parquet. Ignored when --limit is set.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="BATCH mode: evaluate only the first N 2-robot (R1+R2) tasks "
+             "(default: unset → single-task mode via --idx). Pair with "
+             "--offset to skip the first M tasks.",
+    )
+    parser.add_argument(
+        "--offset", type=int, default=0,
+        help="skip the first OFFSET 2-robot tasks (default 0; only used "
+             "with --limit).",
     )
     parser.add_argument(
         "--max-debate-rounds", type=int, default=3,
@@ -2015,10 +2214,14 @@ def main():
     parser.add_argument(
         "--log-dir", default=None,
         help="folder to dump per-call VLM logs to; defaults to logs/<timestamp>/. "
-             "Use --no-log to disable.",
+             "Use --no-log to disable. In --limit mode, each task gets its own "
+             "task_NNNNN_<task_id>/ subdir under this root.",
     )
     parser.add_argument("--no-log", action="store_true",
                         help="disable per-call VLM logging entirely")
+    parser.add_argument("--continue-on-error", action="store_true",
+                        help="in --limit mode, log + continue if a task crashes "
+                             "(default: re-raise and abort the batch)")
     args = parser.parse_args()
 
     # ── Pre-flight: API key ──
@@ -2027,8 +2230,8 @@ def main():
         print("        On PowerShell:  $env:APIMART_API_KEY = 'sk-...'")
         return
 
-    # ── Load the task from the parquet ──
-    from viki_loader import load_viki_task, find_task_indices
+    # ── Resolve parquet path ──
+    from viki_loader import find_task_indices
 
     parquet_path = Path(args.parquet)
     if not parquet_path.is_absolute():
@@ -2037,79 +2240,76 @@ def main():
         print(f"[ERROR] Parquet not found: {parquet_path}")
         return
 
-    if args.idx is None:
-        candidates = find_task_indices(parquet_path, n_robots=2,
-                                       required_ids=("R1", "R2"), limit=1)
-        if not candidates:
-            print("[ERROR] No 2-robot (R1+R2) tasks found in the parquet.")
-            return
-        idx = candidates[0]
+    # ── Pick task indices ──
+    if args.limit is not None:
+        all_indices = find_task_indices(parquet_path, n_robots=2,
+                                        required_ids=("R1", "R2"))
+        indices = all_indices[args.offset:args.offset + args.limit]
+        mode = "BATCH"
+        if args.idx is not None:
+            print(f"[INFO] --limit is set, ignoring --idx={args.idx}.")
+        print(f"[BATCH] {len(all_indices)} total 2-robot tasks; evaluating "
+              f"{len(indices)} (offset={args.offset}, limit={args.limit})")
     else:
-        idx = args.idx
+        if args.idx is None:
+            candidates = find_task_indices(parquet_path, n_robots=2,
+                                           required_ids=("R1", "R2"), limit=1)
+            if not candidates:
+                print("[ERROR] No 2-robot (R1+R2) tasks found in the parquet.")
+                return
+            indices = [candidates[0]]
+        else:
+            indices = [args.idx]
+        mode = "SINGLE"
 
-    task = load_viki_task(parquet_path, idx)
-    robots = task["scene_config"]["robots"]
-    print(f"=== VIKI-L2 task #{idx} (task_id={task['task_id']}) ===")
-    print(f"name        : {task['task_name']}")
-    print(f"robots      : {robots}")
-    print(f"description : {task['task_description']}")
-    print(f"image       : {task['image_path']}")
-    print()
-
-    # ── Build RobotProfiles dynamically from the parquet's `robots` dict ──
-    # (R1/R2 may be any VIKI embodiment — not just fetch/stompy.)
-    if "R1" not in robots or "R2" not in robots:
-        print(f"[ERROR] Task #{idx} does not have both R1 and R2; got {robots}")
-        return
-    robot1 = RobotProfile(name=robots["R1"], robot_id="R1")
-    robot2 = RobotProfile(name=robots["R2"], robot_id="R2")
-
-    # ── Set up VLM call logger (shared by both debaters) ──
-    logger = None
+    # ── Shared log root (each task gets its own subdir in batch mode) ──
+    log_root = (Path(args.log_dir) if args.log_dir else
+                Path(__file__).resolve().parent / "logs" / time.strftime("%Y%m%d_%H%M%S"))
     if not args.no_log:
-        log_dir = Path(args.log_dir) if args.log_dir else (
-            Path(__file__).resolve().parent / "logs" / time.strftime("%Y%m%d_%H%M%S")
-        )
-        logger = RunLogger(log_dir)
-        print(f"logging VLM calls → {log_dir}")
-
-    # ── Instantiate VLMs + simulator + engine ──
-    vlm1 = VLMInterface(role=DebateRole.VLM1_R1_ADVOCATE, logger=logger)
-    vlm2 = VLMInterface(role=DebateRole.VLM2_R2_ADVOCATE, logger=logger)
-    simulator = SimulatorInterface(scene_seed=0)
-
-    engine = MultiAgentDebateEngine(
-        vlm1=vlm1, vlm2=vlm2, simulator=simulator,
-        robot1=robot1, robot2=robot2,
-        max_debate_rounds=args.max_debate_rounds,
-        max_retry_rounds=args.max_retry_rounds,
-    )
+        log_root.mkdir(parents=True, exist_ok=True)
+        print(f"logging VLM calls → {log_root}")
 
     # ── Run ──
-    result = engine.run(
-        task["task_description"], task["image_path"], task["scene_config"]
-    )
+    t0 = time.time()
+    results = []
+    for i, idx in enumerate(indices):
+        if mode == "BATCH":
+            print(f"\n{'=' * 70}\n[{i + 1}/{len(indices)}] task #{idx}\n{'=' * 70}")
+        try:
+            rec = _run_one_task_demo(idx, parquet_path, args, log_root)
+        except KeyboardInterrupt:
+            print("\n[INTERRUPTED]")
+            raise
+        except Exception as e:
+            print(f"[ERROR] task #{idx} crashed: {e}")
+            if mode == "BATCH" and not args.continue_on_error:
+                raise
+            rec = {"idx": idx, "error": f"runtime: {e}"}
+        results.append(rec)
 
-    # ── Report ──
-    print("\n" + "=" * 60)
-    print("FINAL RESULT")
-    print("=" * 60)
-    print(f"Success:        {result['success']}")
-    print(f"Debate rounds:  {result.get('total_debate_rounds')}")
-    print(f"Retry rounds:   {result.get('total_retry_rounds')}")
-    print(f"Final plan:")
-    for step in result["final_plan"].steps:
-        actions = step.get("actions", {})
-        parts = ", ".join(f"{rid}={act}" for rid, act in actions.items())
-        print(f"  Step {step['step']}: {parts}")
-    last_exec = result.get("execution_results", [{}])[-1] if result.get("execution_results") else {}
-    if last_exec:
-        m = last_exec.get("metrics", {})
-        print(f"\nMetrics: activation={m.get('agent_activation_score', 0):.2f}  "
-              f"planning={m.get('task_planning_score', 0):.2f}  "
-              f"trajectory={m.get('trajectory_score', 0):.2f}")
-        if not result["success"] and last_exec.get("failure_reason"):
-            print(f"Failure: step {last_exec.get('failure_step')} — {last_exec['failure_reason']}")
+    # ── Final aggregate (batch mode only — single mode already printed the report) ──
+    if mode != "BATCH":
+        return
+    succ_records = [r for r in results if "success" in r]
+    n_done = len(succ_records)
+    n_succ = sum(1 for r in succ_records if r["success"])
+    loops_list = [r["debate_loops"] for r in succ_records]
+    print()
+    print("=" * 70)
+    print("BATCH FINAL STATISTICS")
+    print("=" * 70)
+    print(f"Tasks evaluated:    {n_done}"
+          + (f"  (+{len(results) - n_done} errors/skipped)"
+             if len(results) > n_done else ""))
+    if n_done:
+        print(f"Tasks succeeded:    {n_succ}")
+        print(f"Success rate:       {n_succ}/{n_done} = {n_succ/n_done:.2%}")
+    if loops_list:
+        print(f"Debate loops:       "
+              f"min={min(loops_list)}  avg={statistics.mean(loops_list):.2f}  "
+              f"max={max(loops_list)}")
+    print(f"Total wall time:    {time.time() - t0:.1f}s"
+          + (f"  ({(time.time() - t0)/n_done:.1f}s per task)" if n_done else ""))
 
 
 if __name__ == "__main__":
