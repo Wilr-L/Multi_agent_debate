@@ -39,7 +39,8 @@
       "Bash(E:/anaconda3/python.exe _test_sse.py)",
       "Bash(rm _test_sse.py)",
       "Bash(E:/anaconda3/python.exe subgoal_completion.py evaluate_results --verbose)",
-      "Bash(E:/anaconda3/python.exe subgoal_completion.py evaluate_results)"
+      "Bash(E:/anaconda3/python.exe subgoal_completion.py evaluate_results)",
+      "Bash(E:/anaconda3/python.exe subgoal_completion.py evaluate_results/local_20260524_020504 evaluate_results/local_20260524_045350)"
     ]
   }
 }

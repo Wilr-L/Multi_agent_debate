@@ -152,38 +152,40 @@ def per_task_satisfied(record: dict, source_dir: Path,
 # ─── Aggregation across one or more leaf dirs ─────────────────────────
 
 def _load_records_from(leaf_dir: Path) -> list[dict]:
+    """Load results.json records; tag each with `_source_dir` so the
+    scorer knows which dir to glob for its task_* folder later."""
     rj = leaf_dir / "results.json"
     if not rj.is_file():
         print(f"[WARN] {leaf_dir}/results.json missing — skipping",
               file=sys.stderr)
         return []
     recs = json.loads(rj.read_text(encoding="utf-8"))
-    return [r for r in recs if "success" in r]
+    return [{**r, "_source_dir": leaf_dir}
+            for r in recs if "success" in r]
 
 
-def score_one_dir(leaf_dir: Path, parquet_path: Path,
-                  sim: SimulatorInterface, verbose: bool = False
-                  ) -> tuple[int, int, dict[str, int]]:
-    """Return (total_satisfied, total_goals, reason_tag_counts) for one
-    leaf result dir."""
-    records = _load_records_from(leaf_dir)
-    if not records:
-        return 0, 0, {}
-
+def _score_records(records: list[dict], parquet_path: Path,
+                   sim: SimulatorInterface, verbose: bool = False
+                   ) -> tuple[int, int, dict[str, int]]:
+    """Score a list of records (each carrying its `_source_dir`).
+    Returns (total_satisfied, total_goals, reason_tag_counts)."""
     total_sat = 0
     total_goals = 0
     tag_counts: dict[str, int] = defaultdict(int)
 
     for r in records:
-        n_sat, n_total, tag = per_task_satisfied(r, leaf_dir, sim, parquet_path)
+        n_sat, n_total, tag = per_task_satisfied(
+            r, r["_source_dir"], sim, parquet_path
+        )
         total_sat   += n_sat
         total_goals += n_total
         tag_counts[tag] += 1
         if verbose:
             ok = "Y" if r.get("success") else "N"
+            src = r["_source_dir"].name
             print(f"    idx={r['idx']:>5}  ok={ok}  "
                   f"goals={n_sat}/{n_total}  [{tag}]  "
-                  f"{r.get('task_id', '')}")
+                  f"src={src:<24s}  {r.get('task_id', '')}")
 
     return total_sat, total_goals, dict(tag_counts)
 
@@ -259,21 +261,32 @@ def main():
     if args.per_dir:
         for d in leaf_dirs:
             print(f"\nProcessing {d.name}...")
-            sat, goals, tags = score_one_dir(d, parquet_path, sim, args.verbose)
+            records = _load_records_from(d)
+            sat, goals, tags = _score_records(records, parquet_path, sim,
+                                              args.verbose)
             _print_summary(d.name, sat, goals, tags)
     else:
-        grand_sat = 0
-        grand_goals = 0
-        grand_tags: dict[str, int] = defaultdict(int)
+        # Merge across all input dirs, dedup by idx — important for
+        # resumed runs where the same baseline's output got split across
+        # multiple `local_*` dirs. Matches aggregate_metrics.py's
+        # "later run wins" convention.
+        by_idx: dict[int, dict] = {}
+        n_dup = 0
         for d in leaf_dirs:
-            print(f"\nProcessing {d.name}...")
-            sat, goals, tags = score_one_dir(d, parquet_path, sim, args.verbose)
-            grand_sat   += sat
-            grand_goals += goals
-            for t, n in tags.items():
-                grand_tags[t] += n
-        _print_summary(f"MERGED ({len(leaf_dirs)} dirs)",
-                       grand_sat, grand_goals, dict(grand_tags))
+            for r in _load_records_from(d):
+                if r["idx"] in by_idx:
+                    n_dup += 1
+                by_idx[r["idx"]] = r              # later dir wins
+        if n_dup:
+            print(f"  [WARN] {n_dup} duplicate idx across dirs — kept "
+                  f"the later dir's record for each.")
+        records = sorted(by_idx.values(), key=lambda x: x["idx"])
+        print(f"\nProcessing {len(records)} unique tasks "
+              f"merged from {len(leaf_dirs)} dir(s)...")
+        sat, goals, tags = _score_records(records, parquet_path, sim,
+                                          args.verbose)
+        _print_summary(f"MERGED ({len(leaf_dirs)} dirs, {len(records)} tasks)",
+                       sat, goals, tags)
 
 
 if __name__ == "__main__":
