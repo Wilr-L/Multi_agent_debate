@@ -32,6 +32,11 @@ Usage
 -----
   python subgoal_completion.py evaluate_results
   python subgoal_completion.py evaluate_results --per-dir --verbose
+  
+  python subgoal_completion.py \
+    /scratch/.../debate_20260530_run1 \
+    /scratch/.../debate_20260530_run2 \
+    /scratch/.../debate_20260530_run3
 """
 
 import argparse
