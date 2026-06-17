@@ -35,6 +35,8 @@ Usage
 """
 
 import argparse
+import contextlib
+import io
 import json
 import re
 import sys
@@ -65,10 +67,18 @@ def final_plan_from_logs(task_dir: Path) -> Optional[TaskPlan]:
     """Walk the task's call logs in order; return the LAST response that
     parses to a valid TaskPlan. Same heuristic as
     aggregate_metrics.final_generated_steps — the executed plan is the
-    debate/refinement loop's last consensus."""
+    debate/refinement loop's last consensus.
+
+    `parse_plan_from_response` print()s a `[WARN] Failed to parse plan: ...`
+    on every JSON parse failure; we walk dozens of logs per task and many
+    contain ACCEPT verdicts / prose / critique JSONs that are not plans,
+    so its noise drowns out the actual progress output. We redirect stdout
+    into a throwaway buffer just around the parse to mute it — the only
+    print inside the function is that WARN, so nothing useful is lost."""
     last = None
     for f in sorted(task_dir.glob("[0-9]*_vlm*.txt")):
-        plan = parse_plan_from_response(_read_response(f))
+        with contextlib.redirect_stdout(io.StringIO()):
+            plan = parse_plan_from_response(_read_response(f))
         if plan is not None:
             last = plan
     return last
