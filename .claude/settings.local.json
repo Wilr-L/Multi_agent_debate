@@ -46,7 +46,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --help)",
-      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --model-path /fake/path --limit 1 --trust-remote-code)"
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --model-path /fake/path --limit 1 --trust-remote-code)",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_baseline_local.py --help)"
     ]
   }
 }
