@@ -38,18 +38,6 @@ Faithful to paper: NO retry loop. `debate_loops = 1` in results.json.
 `debate_rounds_per_loop = [n_rounds_run]` (the # rounds moderator evaluated
 before deciding, or --max-rounds if it timed out and judge kicked in).
 
-Efficiency adaptations for the multimodal setting (deviations from the
-text-only original, documented for the paper):
-  1. The moderator and judge do NOT receive the scene image — they
-     arbitrate between two textual plans using the task description +
-     symbolic world state. Saves ~1500 vision tokens on up to 5 of the
-     11 calls per task.
-  2. When one debater's response is embedded into another agent's
-     prompt, it is COMPACTED first: the plan's `steps` are kept in
-     full, the `reasoning` prose is truncated (see
-     `_compact_debater_response`). Halves prefill length on rebuttal /
-     moderator / judge calls without losing the actionable content.
-
 Example
 -------
   python evaluate_viki_l2_mad.py --model-path /path/to/Qwen2.5-VL-32B-Instruct \\
@@ -132,9 +120,8 @@ their joint plans for a multi-robot task in VIKI-Bench and discussing their pers
 At the end of each round you evaluate the plans and decide whether there is a clear \
 preference for one side. If yes, the debate ends. If no, it continues to the next round.
 
-You do NOT see the scene image. Judge plan feasibility from the task description, the \
-initial world state (ground-truth object positions), and the robot/action rules below — \
-these are sufficient to check pre-conditions, ordering and coordination.
+You have access to the same scene image, robot info and action rules as the debaters, \
+and can independently judge plan feasibility.
 
 {robot_block}
 """
@@ -145,8 +132,7 @@ You are the final judge. Two debaters (Affirmative and Negative) argued about th
 joint plan for a multi-robot task in VIKI-Bench, but the moderator did not reach a decision \
 within the round limit. Your job is to pick the better plan and end the debate.
 
-You do NOT see the scene image. Judge plan feasibility from the task description, the \
-initial world state (ground-truth object positions), and the robot/action rules below.
+You have access to the same scene image, robot info and action rules as the debaters.
 
 {robot_block}
 """
@@ -157,17 +143,6 @@ initial world state (ground-truth object positions), and the robot/action rules 
 _TASK_INTRO = """\
 ## Task
 Look at the scene image. Here is the task description:
-{task_description}
-
-## Initial world state (from the symbolic simulator)
-{world_state}
-"""
-
-
-# Variant for the image-less moderator / judge calls — same content minus
-# the "look at the scene image" instruction.
-_TASK_INTRO_TEXT = """\
-## Task
 {task_description}
 
 ## Initial world state (from the symbolic simulator)
@@ -209,8 +184,8 @@ end your reply with your (possibly revised) plan in the required JSON format.
 """
 
 
-# Moderator prompt at the end of every round (image-less → text intro).
-MODERATOR_PROMPT = _TASK_INTRO_TEXT + """
+# Moderator prompt at the end of every round.
+MODERATOR_PROMPT = _TASK_INTRO + """
 ## The current debate — Round {round_num}
 
 ### Affirmative side arguing
@@ -236,8 +211,7 @@ Respond with strict JSON only (no other text):
 
 
 # Judge fallback — two-step: first list candidates, then pick winner.
-# (Image-less → text intro.)
-JUDGE_PROMPT_1 = _TASK_INTRO_TEXT + """
+JUDGE_PROMPT_1 = _TASK_INTRO + """
 ## Affirmative side's final position
 {aff_ans}
 
@@ -299,39 +273,6 @@ def _extract_json_blob(text: str) -> Optional[str]:
     if s == -1 or e == 0:
         return None
     return text[s:e]
-
-
-def _compact_debater_response(text: str,
-                              max_reasoning_chars: int = 600,
-                              fallback_chars: int = 2000) -> str:
-    """Compact a debater's response before embedding it into ANOTHER
-    agent's prompt: keep the plan `steps` IN FULL (that's what the
-    opponent / moderator / judge must evaluate), truncate the `reasoning`
-    prose. Halves prefill length on rebuttal / moderator / judge calls.
-
-    If the response carries no parseable plan, fall back to plain char
-    truncation so the receiving agent still sees SOMETHING (e.g. a
-    prose-only concession). Mirrors the spirit of
-    MultiAgentDebateEngine._compact_history_msg."""
-    blob = _extract_json_blob(text)
-    if blob is not None:
-        try:
-            d = json.loads(blob)
-        except (json.JSONDecodeError, ValueError):
-            d = None
-        if isinstance(d, dict) and isinstance(d.get("steps"), list):
-            reasoning = str(d.get("reasoning", "")).strip()
-            if not reasoning:
-                # No reasoning field — salvage the prose leading up to
-                # the JSON blob (models often argue before the plan).
-                cut = text.find(blob)
-                reasoning = text[:cut].strip() if cut > 0 else ""
-            if len(reasoning) > max_reasoning_chars:
-                reasoning = reasoning[:max_reasoning_chars] + "..."
-            return json.dumps({"reasoning": reasoning, "steps": d["steps"]},
-                              indent=2)
-    return (text[:fallback_chars] + "..."
-            if len(text) > fallback_chars else text)
 
 
 def _parse_moderator_verdict(response: str) -> dict:
@@ -416,8 +357,7 @@ def run_one_task(task, llm, sampling_params, args, logger, stats):
         image_path=img,
     )
     neg_response = neg.query(
-        NEGATIVE_PROMPT_R1.format(
-            aff_ans=_compact_debater_response(aff_response), **intro_kwargs),
+        NEGATIVE_PROMPT_R1.format(aff_ans=aff_response, **intro_kwargs),
         image_path=img,
     )
     aff_plan = parse_plan_from_response(aff_response)
@@ -438,16 +378,15 @@ def run_one_task(task, llm, sampling_params, args, logger, stats):
     for round_idx in range(1, args.max_rounds + 1):
         total_rounds = round_idx
 
-        # Moderator evaluates the current round's positions. Image-less:
-        # it arbitrates between two textual plans (see module docstring).
+        # Moderator evaluates the current round's positions.
         mod_response = mod.query(
             MODERATOR_PROMPT.format(
                 round_num=round_idx,
-                aff_ans=_compact_debater_response(aff_response),
-                neg_ans=_compact_debater_response(neg_response),
+                aff_ans=aff_response,
+                neg_ans=neg_response,
                 **intro_kwargs,
             ),
-            image_path=None,
+            image_path=img,
         )
         verdict = _parse_moderator_verdict(mod_response)
         pref_yes = verdict["preference"].lower().startswith("y")
@@ -470,13 +409,11 @@ def run_one_task(task, llm, sampling_params, args, logger, stats):
         # response (sequential — matches upstream MAD).
         print(f"\n--- MAD round {round_idx + 1} (rebuttal) ---")
         aff_response = aff.query(
-            DEBATE_PROMPT.format(
-                oppo_ans=_compact_debater_response(neg_response)),
+            DEBATE_PROMPT.format(oppo_ans=neg_response),
             image_path=img,
         )
         neg_response = neg.query(
-            DEBATE_PROMPT.format(
-                oppo_ans=_compact_debater_response(aff_response)),
+            DEBATE_PROMPT.format(oppo_ans=aff_response),
             image_path=img,
         )
         p_aff = parse_plan_from_response(aff_response)
@@ -494,20 +431,17 @@ def run_one_task(task, llm, sampling_params, args, logger, stats):
             role=DebateRole.VLM2_R2_ADVOCATE, logger=logger, stats=stats,
         )
         judge.set_system_prompt(_render_system(JUDGE_META_PROMPT, robots))
-        # Image-less, compacted positions (see module docstring).
         summary = judge.query(
             JUDGE_PROMPT_1.format(
-                aff_ans=_compact_debater_response(aff_response),
-                neg_ans=_compact_debater_response(neg_response),
-                **intro_kwargs,
+                aff_ans=aff_response, neg_ans=neg_response, **intro_kwargs,
             ),
-            image_path=None,
+            image_path=img,
         )
         # Inline the summary into step 2's prompt so this call is stateless
         # (matches the rest of the codebase's stateless VLM contract).
         pick_response = judge.query(
             f"You previously summarized:\n{summary}\n\n" + JUDGE_PROMPT_2,
-            image_path=None,
+            image_path=img,
         )
         winner_side = _parse_judge_verdict(pick_response)
         print(f"  [JUDGE] picked {winner_side}")
