@@ -247,7 +247,6 @@ Rules:
   `[action_type, target_object_or_location, (optional: extra_argument)]`.
 - Only use action primitives that are in that robot's "Available actions" list above.
 - If a robot has no action in a step, set its value to `["Wait"]`.
-- Every step MUST include an entry for every robot (use `["Wait"]` for idle).
 """
 
 
@@ -276,8 +275,7 @@ Think step by step:
 4. What actions should {partner_a_id} and {partner_b_id} perform in parallel?
 5. Are there any dependencies or ordering constraints between the three robots?
 
-Output the complete joint plan in the required JSON format (every step must include all \
-three robots, using `["Wait"]` for any robot that is idle).
+Output the complete joint plan in the required JSON format.
 """
 
 
@@ -303,7 +301,7 @@ ACCEPT/REVISE verdict wrapper). Every step MUST contain an entry for every robot
 {{
   "reasoning": "why you merged this way, including any conflict resolutions across the three plans...",
   "steps": [
-    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"], "R3": ["Wait"]}}}}
+    {{"step": 1, "actions": {{"R1": ["Move", "pumpkin"], "R2": ["Move", "apple"], "R3": ["Move", "box"]}}}}
   ]
 }}
 ```
