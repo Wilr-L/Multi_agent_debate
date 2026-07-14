@@ -207,16 +207,13 @@ hypotheses, or guesses are allowed.
 Action must follow the following format as a JSON list, for example [\"Move\", \"plate\"] or [\"grasp\", \"banana\"]. It describes the single action that robot will perform in this step, with the following format: action_type, target_object_or_location\nAction primitives and descriptions: {{'Move': \"Command ['Move', 'object']: Robot R moves to the specified object.(Move to the object! Not move the object to other place!)\", 'Reach': \"Command ['Reach', 'object']: Robot R reaches the specified object.\", 'Grasp': \"Command ['Grasp', 'object']: Robot R's end effector performs a grasping operation on a specified object.\", 'Place': \"Command ['Place', 'object']: Place the thing held by the Robot R's end effector at a specified location ('object' means location).\", 'Open': \"Command ['Open', 'object']: Open the object held by the Robot R's end effector.\", 'Close': \"Command ['Close', 'object']: Close the object held by the Robot R's end effector.\", 'Push': \"Command ['Push', 'object', 'R1']: Robot R pushes the object to robot R1.\", 'Interact': \"Command ['Interact', 'object']: A general interaction operation, flexible for representing interactions with any asset.\"}}
 Use exact object and location names from the task, relevant assets, and world state. Do not invent new entity names.
 Choose the primitive that advances the current object state, not just the task name.
-  - If the robot is not near the object, use Move on the object. If the robot is going to reach an apple, the robot should move to the apple but not the location like table or cabinet.
+  - If the robot is not near the object, use Move on the object. Note that the robot should move to the object like apple but not the location like table or cabinet.
   - If the robot is at/near the object but has not reached it, use Reach on the object.
   - If the robot has reached the object and is not carrying it, use Grasp on the object.
   - If the robot is carrying an object and it is not at the target, use Move on the target location or target object.
   - If the robot is carrying an object at the target area, use Place on the target location.
   - If an appliance or device must be started or activated, use Interact on that appliance after the required object is placed or available.
   - If the robot needs to cut an object on a cutting borad, the robot should hold a knife, and move to the cutting board and then interact with the knife to cut the object on the cutting board.
-  - If something is at the kitchen work area, the robot could move to, reach, and grasp it. If something is in the carbinet, the robot should first open the carbinet.
-  - If the robot needs to open the carbinet, fridge, or other container, the robots should move to and reach and then open it.
-  - If the robot has opened the carbinet to grasp an apple in it, the robot still needs to move to, reach and then grasp the apple.
   - Note that the robot should not always wait throughout all steps.
 
 ## Your role
