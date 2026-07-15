@@ -1411,16 +1411,35 @@ class SimulatorInterface:
 
     @staticmethod
     def _render_world_state(judger: DebateEval, header: str) -> str:
-        """Pretty-print the abstract world held by `judger.env`."""
+        """Pretty-print the abstract world held by `judger.env`.
+
+        When two robots share the same VIKI type (e.g. two `panda` arms),
+        VIKI disambiguates them by a fixed BASE POSITION stored as an asset
+        keyed by the robot id — e.g. `init_pos["R1"] == ["pandaB"]` becomes
+        `assets["R1"].pos.name == "pandaB"`. Without surfacing this, the two
+        agent lines render identically as `R1(panda)` / `R2(panda)` and the
+        VLM cannot tell which arm is where (critical for reachability).
+
+        So we fold the base position into the agent's type label
+        (`R1(panda@pandaB)`) and suppress the now-redundant base-marker
+        asset line. This is a DISPLAY-only change — the underlying metadata
+        (and therefore the symbolic checker) is untouched."""
         lines = [header]
+        agent_ids = set(judger.env.agents.keys())
         for name, agent in judger.env.agents.items():
             reached = [o.name for o in agent.get_reached_objects()]
             carried = [o.name for o in agent.get_carried_objects()]
+            # Base-position marker for same-type disambiguation, if any.
+            base_asset = judger.env.assets.get(name)
+            base = f"@{base_asset.pos.name}" if base_asset is not None else ""
             lines.append(
-                f"  - {name}({agent.type}) pos={agent.pos.name} "
+                f"  - {name}({agent.type}{base}) pos={agent.pos.name} "
                 f"reached={reached} carried={carried}"
             )
         for name, asset in judger.env.assets.items():
+            # Skip base-position markers already folded into the agent line.
+            if name in agent_ids:
+                continue
             extras = []
             if asset.is_grasped_by:
                 extras.append(f"grasped_by={[a.name for a in asset.is_grasped_by]}")
