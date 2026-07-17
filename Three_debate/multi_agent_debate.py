@@ -994,6 +994,7 @@ class _PatchedChecker(_VIKICheckerBase):
     """
     Bug-fix overlay on VIKI's `Checker.check_compatible_constraints`.
 
+    Fix 1 — `close` indexing:
     Upstream ([checker.py:160] of the VIKI clone) does:
         target_container = params[commands.index('close')][0]
     but `params[i]` is `[Agent, Target1, ...]` — index [0] is the *agent
@@ -1002,8 +1003,25 @@ class _PatchedChecker(_VIKICheckerBase):
         AttributeError: 'Agent' object has no attribute 'container_position'
     on every plan containing a `close` command.
 
-    This subclass keeps the rest of the method identical and only fixes
-    the indexing (plus defensive guards for malformed close commands).
+    Fix 2 — acting agent counted as a shared "target entity":
+    The shared-entity loop is supposed to catch two robots manipulating the
+    SAME asset in one step. VIKI's own comment says
+        # params for inst idx, skip operation agent (param[0])
+    yet the loop iterates `for param in inst_params:` and does NOT skip the
+    acting agent at index 0. This is harmless on tasks with distinct robot
+    types (agent ids never appear as assets), but for DUPLICATE-robot-type
+    tasks VIKI stores each robot's fixed base position as an asset keyed by
+    the robot id (e.g. asset "R1" -> pandaB). Then the acting agent 'R1'
+    is `in assets`, so a step like
+        R1: [Grasp, pear]   +   R2: [Push, cardboardbox, R1]
+    makes 'R1' a shared entity between the grasp (its actor) and the push
+    (its recipient), and grasp+push is deemed incompatible → spurious
+    ACTION_NOT_COMPATIBLE. This exactly matches VIKI's OWN ground-truth
+    plan for the two-panda `dog_push_box_for_two_panda_transport` family,
+    so upstream would fail its own reference solution. We skip index 0
+    (the acting agent) per VIKI's stated intent. Only ever affects
+    duplicate-robot-type tasks — all 46 VIKI-L2 3-robot tasks, zero
+    2-robot tasks.
     """
 
     def check_compatible_constraints(self, step_commands: list,
@@ -1020,7 +1038,10 @@ class _PatchedChecker(_VIKICheckerBase):
 
         target_entities: dict = {}
         for idx, inst_params in enumerate(params):
-            for param in inst_params:
+            # Skip inst_params[0] — the ACTING agent — per VIKI's own comment
+            # (see Fix 2 in the class docstring). Only true target entities
+            # count toward the shared-asset conflict check.
+            for param in inst_params[1:]:
                 if param.name in assets:
                     target_entities.setdefault(param.name, []).append(idx)
 
