@@ -211,8 +211,9 @@ Choose the primitive that advances the current object state, not just the task n
   - If the robot is at/near the object but has not reached it, use Reach on the object.
   - If the robot has reached the object and is not carrying it, use Grasp on the object.
   - If the robot is carrying an object at the target area, use Place on the target location.
-  - Robot panda cannot move, if it is already at the object, it can directly Reach, Grasp, Place.
-  - Robot unitree_go2 and anymal_c can move to the cardboardbox and push it to other robots like panda.
+  - Robot panda cannot move, if it is already at the object area, it can directly Reach or Grasp the object.
+  - Robot unitree_go2 and anymal_c can move to the cardboardbox and push it to the locations of other robots like panda.
+  - In most tasks, cardboardbox plays the role of a carrier, anymal_c/unitree_go2 can push it to other robots' locations, panda can take things out of or put things in a cardboardbox. 
   - Note that the robot should not always wait throughout all steps.
 
 ## Your role
