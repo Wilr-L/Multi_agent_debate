@@ -47,7 +47,9 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --help)",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --model-path /fake/path --limit 1 --trust-remote-code)",
-      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_baseline_local.py --help)"
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_baseline_local.py --help)",
+      "Bash(grep -nE \"^import re$|^import |^from \" multi_agent_debate.py)",
+      "Bash(awk '/--- assistant \\\\\\(response\\\\\\) ---/{flag=1;next}flag' 005_vlm2.txt)"
     ]
   }
 }

@@ -21,6 +21,7 @@ import json
 import copy
 import base64
 import os
+import re
 import sys
 import time
 import random
@@ -804,46 +805,134 @@ def _normalize_step(step: dict, fallback_idx: int) -> dict:
     return out
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
+def _iter_balanced_json_objects(text: str):
+    """Yield every top-level, balanced ``{...}`` substring in `text`, in
+    order. Brace-tracking is string-aware — braces that appear INSIDE a
+    JSON string literal (including escaped quotes) do NOT open/close an
+    object, so reasoning prose like ``"reasoning": "move to {pandaB}"``
+    does not corrupt the scan."""
+    depth, start = 0, None
+    in_str, esc = False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    yield text[start:i + 1]
+                    start = None
+
+
+def _extract_json_dicts(response: str) -> list[dict]:
+    """Return every parseable JSON dict in `response`. Considers both
+    ```json fenced blocks AND raw balanced ``{...}`` spans, so it works
+    whether or not the model wrapped its answer in a code fence. Order is
+    preserved so callers can take the LAST (the model's final answer,
+    after any chain-of-thought)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    candidates: list[str] = list(_JSON_FENCE_RE.findall(response))
+    candidates.extend(_iter_balanced_json_objects(response))
+    for c in candidates:
+        c = c.strip()
+        if c in seen:
+            continue
+        seen.add(c)
+        try:
+            # strict=False tolerates literal newlines / control chars INSIDE
+            # string values — the single most common malformed-JSON mistake
+            # VLMs make (they write a multi-line `"reasoning": "..."` with
+            # real line breaks instead of escaped `\n`). Default strict=True
+            # rejects those with "Invalid control character" and the whole
+            # ACCEPT/REVISE verdict would be lost.
+            data = json.loads(c, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def _last_answer_dict(response: str) -> Optional[dict]:
+    """Return the LAST JSON dict that actually carries an answer — a
+    `verdict`, `steps`, or `revised_plan` key. Ignores stray/echoed JSON
+    fragments in the model's reasoning. Falls back to the last dict of
+    any shape, else None.
+
+    This is the key robustness fix over the old `first-{ ... last-}` slice,
+    which broke whenever the model emitted ANY brace before its real
+    answer (echoed schema, prose with `{}`, a worked example, …) — a
+    misparse there silently flipped a genuine ACCEPT into a non-accept and
+    reset the debate's consecutive-ACCEPT streak, so consensus was never
+    detected and the loop ran to max rounds."""
+    dicts = _extract_json_dicts(response)
+    answers = [d for d in dicts
+               if "verdict" in d or "steps" in d or "revised_plan" in d]
+    if answers:
+        return answers[-1]
+    return dicts[-1] if dicts else None
+
+
 def parse_plan_from_response(response: str) -> Optional[TaskPlan]:
     """Extract structured plan from VLM response and normalize to VIKI schema."""
-    try:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start == -1 or json_end == 0:
-            return None
-
-        data = json.loads(response[json_start:json_end])
-
-        # Handle both ACCEPT and REVISE formats
-        if "verdict" in data:
-            if data["verdict"] == "ACCEPT":
-                return None  # No new plan, current one is accepted
-            elif "revised_plan" in data:
-                data = data["revised_plan"]
-
-        if "steps" not in data:
-            return None
-
-        steps = [_normalize_step(s, i) for i, s in enumerate(data["steps"])]
-        return TaskPlan(
-            steps=steps,
-            reasoning=data.get("reasoning", ""),
-            raw_text=response,
-        )
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"[WARN] Failed to parse plan: {e}")
+    data = _last_answer_dict(response)
+    if data is None:
         return None
+
+    # Handle both ACCEPT and REVISE formats
+    if "verdict" in data:
+        if str(data["verdict"]).upper() == "ACCEPT":
+            return None  # No new plan, current one is accepted
+        rp = data.get("revised_plan")
+        if isinstance(rp, dict):
+            data = rp
+
+    if "steps" not in data or not isinstance(data["steps"], list):
+        return None
+
+    try:
+        steps = [_normalize_step(s if isinstance(s, dict) else {}, i)
+                 for i, s in enumerate(data["steps"])]
+    except Exception as e:
+        print(f"[WARN] Failed to normalize plan steps: {e}")
+        return None
+    return TaskPlan(
+        steps=steps,
+        reasoning=data.get("reasoning", ""),
+        raw_text=response,
+    )
 
 
 def is_accept_response(response: str) -> bool:
-    """Check if a VLM response is an ACCEPT verdict."""
-    try:
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        data = json.loads(response[json_start:json_end])
-        return data.get("verdict", "").upper() == "ACCEPT"
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return False
+    """Check if a VLM response is an ACCEPT verdict. Robust to models that
+    emit chain-of-thought (and stray braces) before the final JSON."""
+    data = _last_answer_dict(response)
+    if data is not None and "verdict" in data:
+        return str(data.get("verdict", "")).upper() == "ACCEPT"
+    # Regex fallback for when no clean JSON object could be isolated but the
+    # verdict is still stated literally. Only treat as ACCEPT if an ACCEPT
+    # verdict appears and no REVISE verdict does.
+    has_accept = re.search(r'["\']?verdict["\']?\s*:\s*["\']ACCEPT["\']',
+                           response, re.IGNORECASE)
+    has_revise = re.search(r'["\']?verdict["\']?\s*:\s*["\']REVISE["\']',
+                           response, re.IGNORECASE)
+    return bool(has_accept and not has_revise)
 
 
 # ─────────────────────────────────────────────
@@ -1484,14 +1573,11 @@ class MultiAgentDebateEngine:
           • Plain plan : {reasoning, steps}
           • Critique   : {verdict, issues?, revised_plan: {reasoning, steps}}
                          or {verdict: "ACCEPT", reasoning}"""
-        s = content.find("{")
-        e = content.rfind("}") + 1
-        if s == -1 or e == 0:
-            return (content[:fallback_chars] + "..."
-                    if len(content) > fallback_chars else content)
-        try:
-            data = json.loads(content[s:e])
-        except (json.JSONDecodeError, TypeError):
+        # Reuse the robust extractor (strict=False, last-answer object) so
+        # this stays consistent with is_accept_response / parse_plan_from_
+        # response and survives literal-newline JSON.
+        data = _last_answer_dict(content)
+        if data is None:
             return (content[:fallback_chars] + "..."
                     if len(content) > fallback_chars else content)
 
