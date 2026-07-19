@@ -49,7 +49,12 @@
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_mad.py --model-path /fake/path --limit 1 --trust-remote-code)",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_baseline_local.py --help)",
       "Bash(grep -nE \"^import re$|^import |^from \" multi_agent_debate.py)",
-      "Bash(awk '/--- assistant \\\\\\(response\\\\\\) ---/{flag=1;next}flag' 005_vlm2.txt)"
+      "Bash(awk '/--- assistant \\\\\\(response\\\\\\) ---/{flag=1;next}flag' 005_vlm2.txt)",
+      "Bash(mkdir -p Three-baseline)",
+      "Bash(cp Three_debate/multi_agent_debate.py Three-baseline/)",
+      "Bash(cp Three_debate/evaluate_viki_l2_localmodel.py Three-baseline/)",
+      "Bash(cp viki_loader.py Three-baseline/)",
+      "Bash(cp single_agent_common.py Three-baseline/)"
     ]
   }
 }
