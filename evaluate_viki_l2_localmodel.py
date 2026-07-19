@@ -304,11 +304,19 @@ def parse_args():
     p.add_argument("--offset", type=int, default=0,
                    help="skip the first OFFSET tasks (default 0).")
 
-    # Debate
+    # Debate — the two knobs for the parameter study
     p.add_argument("--max-debate-rounds", type=int, default=3,
-                   help="max rounds per Phase-2 invocation (default 3).")
+                   help="MAX DEBATE ROUNDS: how many VLM1→VLM2 back-and-forth "
+                        "rounds one Phase-2 debate runs before forcing "
+                        "consensus and handing the plan to the simulator. "
+                        "Higher = more deliberation per attempt. "
+                        "(default 3; sweep e.g. 2/3/5/8)")
     p.add_argument("--max-retry-rounds", type=int, default=2,
-                   help="max retries on execution failure (default 2).")
+                   help="MAX RETRY LOOPS: how many times a FAILED plan is "
+                        "re-debated (Phase-4 reflection → new Phase-2 debate → "
+                        "re-execute) after the first execution. 0 = execute "
+                        "once, never retry; N = up to N+1 total executions. "
+                        "(default 2; sweep e.g. 2/3/5)")
 
     # Logging / output
     p.add_argument("--log-dir", default=None,
