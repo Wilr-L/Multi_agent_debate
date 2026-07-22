@@ -86,13 +86,13 @@ Action primitives and descriptions:
 Use exact object and location names from the task, relevant assets, and world state. Do not \
 invent new entity names.
 Choose the primitive that advances the current object state, not just the task name:
-  - If the robot is not near the object, use Move on the object.
   - If the robot is at/near the object but has not reached it, use Reach on the object.
   - If the robot has reached the object and is not carrying it, use Grasp on the object.
-  - If the robot is carrying an object and it is not at the target, use Move on the target.
   - If the robot is carrying an object at the target area, use Place on the target location.
-  - If an appliance or device must be started or activated, use Interact on that appliance \
-after the required object is placed or available.
+  - Robot panda cannot move, if it is already at the object area, it can directly Reach or Grasp the object.
+  - Robot unitree_go2 and anymal_c can move to the cardboardbox and push it to the locations of other robots like panda.
+  - In most tasks, cardboardbox plays the role of a carrier, anymal_c/unitree_go2 can push it to other robots' locations, panda can take things out of or put things in a cardboardbox. 
+  - Note that the robot should not always wait throughout all steps.
   - **Each robot can only perform ONE action per time step.** Multiple robots may work in \
 parallel but each is limited to one action per step.
 
