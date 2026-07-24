@@ -54,7 +54,19 @@
       "Bash(cp Three_debate/multi_agent_debate.py Three-baseline/)",
       "Bash(cp Three_debate/evaluate_viki_l2_localmodel.py Three-baseline/)",
       "Bash(cp viki_loader.py Three-baseline/)",
-      "Bash(cp single_agent_common.py Three-baseline/)"
+      "Bash(cp single_agent_common.py Three-baseline/)",
+      "Bash(E:/anaconda3/python.exe -c \"import ast; ast.parse\\(open\\('evaluate_viki_l2.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2.py --help)",
+      "Bash(E:/anaconda3/python.exe -c \"import ast; ast.parse\\(open\\('evaluate_viki_l2_openai.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_openai.py --help)",
+      "Bash(E:/anaconda3/python.exe -c \"import openai; print\\('openai', openai.__version__\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(E:/anaconda3/python.exe --version)",
+      "Bash(E:/anaconda3/python.exe -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(E:/anaconda3/python.exe -m pip install openai)",
+      "Bash(E:/anaconda3/python.exe -c \"import openai; print\\('openai', openai.__version__, 'OK'\\)\")",
+      "Bash(E:/anaconda3/python.exe evaluate_viki_l2_openai.py --limit 1)",
+      "Bash(E:/anaconda3/python.exe subgoal_completion_3embodi.py 3-mebodi-logs --verbose)"
     ]
   }
 }

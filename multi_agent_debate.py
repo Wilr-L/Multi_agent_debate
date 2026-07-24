@@ -515,6 +515,7 @@ class VLMInterface:
     DEFAULT_MODEL    = "gpt-4o"
     # DEFAULT_MODEL    = "Qwen/Qwen3-VL-32B-Instruct"   # if APIMart hosts it
     DEFAULT_BASE_URL = "https://api.apimart.ai/v1"
+    # DEFAULT_BASE_URL = "https://api.openai.com/v1/chat/completions"
 
     def __init__(
         self,

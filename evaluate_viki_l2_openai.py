@@ -1,21 +1,46 @@
 """
-evaluate_viki_l2
-================
-Run the multi-agent-debate pipeline on every 2-robot (R1+R2) task in
-`VIKI_data/viki/VIKI-L2/test.parquet` and aggregate:
+evaluate_viki_l2_openai
+=======================
+Same 4-phase multi-agent-debate evaluation as `evaluate_viki_l2.py`
+(Phase 1 proposals+merge → Phase 2 debate → Phase 3 symbolic execution →
+Phase 4 reflection+retry), but the two debater VLMs talk to the
+**official OpenAI API** through the official `openai` Python SDK instead
+of APIMart.
 
-  - task success rate
-  - max / min / avg of debate-loop count per task
-        (= number of Phase-2 invocations, i.e. 1 + actual retry count)
-  - max / min / avg of debate-round count per Phase-2 invocation
+Reference: https://developers.openai.com/api/docs/quickstart
 
-TensorBoard scalars are written live after each task. Launch in another
-terminal:
-    tensorboard --logdir tb_logs
+Design
+------
+`OpenAIVLMInterface` subclasses `VLMInterface` and overrides ONLY the
+HTTP transport (`_post_with_retry`): the official SDK call's response is
+converted back to the plain chat-completions dict via `.model_dump()`,
+so every inherited behavior — stateless message building, base64 image
+encoding, empty-content retry, RunLogger integration — keeps working
+unchanged. The payload's `max_tokens` is translated to
+`max_completion_tokens` (the current official parameter name; accepted
+by gpt-4o and required by o-series / gpt-5 reasoning models).
+
+Setup:
+    pip install openai
+    # PowerShell:
+    $env:OPENAI_API_KEY = "sk-..."
+    # bash:
+    export OPENAI_API_KEY="sk-..."
 
 Example:
-    $env:APIMART_API_KEY = "sk-..."
-    E:\\anaconda3\\python.exe evaluate_viki_l2.py --limit 20
+    E:\\anaconda3\\python.exe evaluate_viki_l2_openai.py --limit 20
+    E:\\anaconda3\\python.exe evaluate_viki_l2_openai.py \\
+        --model-name gpt-4o-mini --temperature 0.3 --limit 20
+
+Notes:
+  - Default model: gpt-4o (vision-capable; the scene image is sent as a
+    base64 data URL exactly like the other evaluators).
+  - o-series / gpt-5 reasoning models reject non-default temperature /
+    top_p; if you evaluate one of those, the API error will say so —
+    rerun without overriding them (or set --temperature 1 --top-p 1).
+  - results.json schema and TensorBoard tag names match
+    evaluate_viki_l2.py exactly, so aggregate_metrics.py /
+    stratified_acc.py work unchanged and runs overlay in TB.
 """
 
 import argparse
@@ -26,8 +51,8 @@ import time
 import statistics
 import traceback
 from pathlib import Path
+from typing import Optional
 
-# TensorBoard writer — prefer tensorboardX (no torch dep), fall back to torch.
 try:
     from tensorboardX import SummaryWriter
 except ImportError:
@@ -43,10 +68,95 @@ from multi_agent_debate import (
 )
 
 
+# ─── Official-SDK transport for VLMInterface ─────────────────────────
+
+class OpenAIVLMInterface(VLMInterface):
+    """`VLMInterface` with the raw-`requests` transport swapped for the
+    official `openai` SDK. Everything else (stateless messages, image
+    data-URLs, empty-content retry loop, logging) is inherited.
+
+    The SDK client is created once per instance with the inherited
+    `timeout` / `max_retries` settings, so SDK-level retry/backoff
+    replaces the hand-rolled HTTP retry of the parent class."""
+
+    DEFAULT_MODEL = "gpt-4o"
+
+    def __init__(self, *args, base_url: Optional[str] = None, **kwargs):
+        kwargs.setdefault("model_name", self.DEFAULT_MODEL)
+        kwargs.setdefault("api_key", os.environ.get("OPENAI_API_KEY"))
+        # Parent's base_url only matters for its own transport (unused
+        # here), but keep it coherent for logs.
+        super().__init__(*args, base_url=base_url or "https://api.openai.com/v1",
+                         **kwargs)
+
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise ImportError(
+                "The official OpenAI SDK is required: pip install openai"
+            ) from e
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url=base_url,            # None → official endpoint
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+        )
+
+    def _post_with_retry(self, path: str, payload: dict) -> dict:
+        """Send the chat completion through the official SDK and return
+        the plain-dict response the inherited `query()` expects.
+
+        `max_tokens` → `max_completion_tokens`: the official API renamed
+        the parameter; the new name is accepted by gpt-4o-family models
+        and REQUIRED by o-series / gpt-5 reasoning models.
+
+        Two retry layers:
+          - SDK-internal (client max_retries): fast back-to-back retries
+            for 429/5xx/connect errors — good for momentary hiccups.
+          - This outer loop: LONG exponential backoff (3s/9s/27s) for
+            connection errors that outlast the SDK's quick retries —
+            typical when api.openai.com is reached through an unstable
+            proxy/VPN and the tunnel drops for several seconds
+            (symptom: `WinError 10054` connection-reset during the TLS
+            handshake inside httpcore's http_proxy transport)."""
+        kwargs = dict(payload)
+        max_tokens = kwargs.pop("max_tokens", None)
+        if max_tokens is not None:
+            kwargs["max_completion_tokens"] = max_tokens
+
+        from openai import (APIConnectionError, RateLimitError,
+                            InternalServerError)
+        outer_attempts = 4
+        last_err: Optional[Exception] = None
+        for attempt in range(outer_attempts):
+            try:
+                resp = self._client.chat.completions.create(**kwargs)
+                return resp.model_dump()
+            except (APIConnectionError, RateLimitError,
+                    InternalServerError) as e:
+                last_err = e
+                if attempt == outer_attempts - 1:
+                    break
+                backoff = 3.0 ** (attempt + 1)          # 3s, 9s, 27s
+                print(f"[WARN] {self.role.value}: {type(e).__name__} — "
+                      f"retrying in {backoff:.0f}s "
+                      f"(outer attempt {attempt + 2}/{outer_attempts})...")
+                time.sleep(backoff)
+        raise RuntimeError(
+            f"OpenAI API failed after {outer_attempts} outer attempts "
+            f"(each with SDK-internal retries). Last error: {last_err}. "
+            f"If this is APIConnectionError / WinError 10054 and your "
+            f"traffic goes through a proxy/VPN, the tunnel is unstable — "
+            f"switch proxy node or check its TLS handling."
+        ) from last_err
+
+
 # ─── CLI ────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate VIKI-L2 2-robot tasks")
+    p = argparse.ArgumentParser(
+        description="Evaluate VIKI-L2 2-robot tasks — 4-phase debate via "
+                    "the official OpenAI API")
     p.add_argument("--parquet", default="VIKI_data/viki/VIKI-L2/test.parquet",
                    help="path to the VIKI-L2 parquet")
     p.add_argument("--limit", type=int, default=None,
@@ -57,21 +167,25 @@ def parse_args():
                    help="max rounds per Phase-2 invocation (default 3)")
     p.add_argument("--max-retry-rounds", type=int, default=2,
                    help="max retries on execution failure (default 2)")
+    p.add_argument("--model-name", default="gpt-4o",
+                   help="OpenAI model id (default gpt-4o; must be "
+                        "vision-capable for the scene image)")
     p.add_argument("--temperature", type=float, default=0.3,
-                   help="sampling temperature for both debater VLMs "
-                        "(default 0.3 — VLMInterface's default)")
+                   help="sampling temperature (default 0.3; reasoning "
+                        "models like o-series/gpt-5 only accept 1)")
     p.add_argument("--top-p", type=float, default=0.7,
-                   help="top-p for both debater VLMs (default 0.7)")
+                   help="top-p (default 0.7; reasoning models only accept 1)")
     p.add_argument("--max-tokens", type=int, default=4096,
-                   help="max generated tokens per API call (default 4096)")
-    p.add_argument("--model-name", default=None,
-                   help="override the API model id for both debaters "
-                        "(default: VLMInterface.DEFAULT_MODEL, currently gpt-4o)")
+                   help="max completion tokens per call (default 4096; sent "
+                        "as `max_completion_tokens`)")
+    p.add_argument("--base-url", default=None,
+                   help="override the API base URL (default: official "
+                        "api.openai.com; use for Azure/OpenAI-compatible proxies)")
     p.add_argument("--log-dir", default=None,
                    help="root dir for per-task VLM-call logs; "
-                        "defaults to logs/eval_<timestamp>")
+                        "defaults to logs/openai_<timestamp>")
     p.add_argument("--tb-dir", default=None,
-                   help="TensorBoard log dir; defaults to tb_logs/eval_<timestamp>")
+                   help="TensorBoard log dir; defaults to tb_logs/openai_<timestamp>")
     p.add_argument("--results-json", default=None,
                    help="path to dump per-task results JSON "
                         "(defaults to <log-dir>/results.json)")
@@ -99,9 +213,10 @@ def fmt_stats(label: str, values: list) -> str:
 def main():
     args = parse_args()
 
-    if not os.environ.get("APIMART_API_KEY"):
-        print("[ERROR] APIMART_API_KEY is not set.", file=sys.stderr)
-        print("        On PowerShell:  $env:APIMART_API_KEY = 'sk-...'", file=sys.stderr)
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("[ERROR] OPENAI_API_KEY is not set.", file=sys.stderr)
+        print("        On PowerShell:  $env:OPENAI_API_KEY = 'sk-...'",
+              file=sys.stderr)
         sys.exit(1)
 
     # ── Resolve paths ──
@@ -114,9 +229,9 @@ def main():
         sys.exit(1)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    log_root = Path(args.log_dir) if args.log_dir else (root / "logs" / f"eval_{stamp}")
+    log_root = Path(args.log_dir) if args.log_dir else (root / "logs" / f"openai_{stamp}")
     log_root.mkdir(parents=True, exist_ok=True)
-    tb_dir = Path(args.tb_dir) if args.tb_dir else (root / "tb_logs" / f"eval_{stamp}")
+    tb_dir = Path(args.tb_dir) if args.tb_dir else (root / "tb_logs" / f"openai_{stamp}")
 
     # ── Find tasks ──
     print(f"Scanning parquet for 2-robot (R1+R2) tasks: {parquet_path}")
@@ -137,6 +252,7 @@ def main():
         print(f"TensorBoard logs    → {tb_dir}")
         print(f"  view:  tensorboard --logdir {tb_dir.parent}")
 
+    print(f"Model               → {args.model_name} (official OpenAI API)")
     print(f"Per-task logs       → {log_root}")
     results_json = (Path(args.results_json) if args.results_json
                     else log_root / "results.json")
@@ -169,22 +285,19 @@ def main():
         if not args.no_vlm_log:
             rlog = RunLogger(log_root / f"task_{idx:05d}_{task['task_id']}")
 
-        # Engine
+        # Engine — official-SDK debaters
         robot1 = RobotProfile(name=robots["R1"], robot_id="R1")
         robot2 = RobotProfile(name=robots["R2"], robot_id="R2")
-        # Sampling params come from CLI (--temperature / --top-p /
-        # --max-tokens / --model-name); unset model_name falls back to
-        # VLMInterface.DEFAULT_MODEL.
         vlm_kwargs = dict(
+            model_name=args.model_name,
             temperature=args.temperature,
             top_p=args.top_p,
             max_tokens=args.max_tokens,
+            base_url=args.base_url,
             logger=rlog,
         )
-        if args.model_name:
-            vlm_kwargs["model_name"] = args.model_name
-        vlm1 = VLMInterface(role=DebateRole.VLM1_R1_ADVOCATE, **vlm_kwargs)
-        vlm2 = VLMInterface(role=DebateRole.VLM2_R2_ADVOCATE, **vlm_kwargs)
+        vlm1 = OpenAIVLMInterface(role=DebateRole.VLM1_R1_ADVOCATE, **vlm_kwargs)
+        vlm2 = OpenAIVLMInterface(role=DebateRole.VLM2_R2_ADVOCATE, **vlm_kwargs)
         sim  = SimulatorInterface(scene_seed=0)
         eng  = MultiAgentDebateEngine(
             vlm1, vlm2, sim, robot1, robot2,
@@ -227,6 +340,7 @@ def main():
             "task_id":         task["task_id"],
             "task_name":       task["task_name"],
             "robots":          robots,
+            "model_name":      args.model_name,
             "success":         success,
             "debate_loops":    loops,
             "debate_rounds_per_loop": rounds_per_loop,
@@ -273,7 +387,7 @@ def main():
     # ── Final report ──
     print()
     print("=" * 70)
-    print("FINAL STATISTICS")
+    print("FINAL STATISTICS — 4-phase debate via official OpenAI API")
     print("=" * 70)
 
     succ_records = [r for r in results if "success" in r]
@@ -285,6 +399,7 @@ def main():
     loops_list = [r["debate_loops"] for r in succ_records]
     all_rounds = [r for rec in succ_records for r in rec["debate_rounds_per_loop"]]
 
+    print(f"Model:              {args.model_name}")
     print(f"Tasks evaluated:    {n_done}")
     print(f"Tasks succeeded:    {n_success}")
     print(f"Success rate:       {n_success}/{n_done} = {n_success/n_done:.2%}")
