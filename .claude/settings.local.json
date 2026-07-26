@@ -66,7 +66,11 @@
       "Bash(E:/anaconda3/python.exe -m pip install openai)",
       "Bash(E:/anaconda3/python.exe -c \"import openai; print\\('openai', openai.__version__, 'OK'\\)\")",
       "Bash(E:/anaconda3/python.exe evaluate_viki_l2_openai.py --limit 1)",
-      "Bash(E:/anaconda3/python.exe subgoal_completion_3embodi.py 3-mebodi-logs --verbose)"
+      "Bash(E:/anaconda3/python.exe subgoal_completion_3embodi.py 3-mebodi-logs --verbose)",
+      "Bash(E:/anaconda3/python.exe subgoal_completion_3embodi.py Three-baseline/logs/baseline_openai3_20260724_180409 --parquet VIKI_data/viki/VIKI-L2/train.parquet)",
+      "Bash(E:/anaconda3/python.exe -c \"import psutil\")",
+      "Bash(E:/anaconda3/python.exe -c \"import ast; ast.parse\\(open\\('subgoal_completion_3embodi.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(E:/anaconda3/python.exe subgoal_completion_3embodi.py Three-baseline/logs/baseline_openai3_20260724_180409)"
     ]
   }
 }
